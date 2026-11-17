@@ -321,7 +321,9 @@
     tabEl.querySelector('.x').addEventListener('click', (e) => { e.stopPropagation(); closeTab(id); });
     tabsBar.appendChild(tabEl);
 
-    t = { id, host: '', name: '', path: '', el, tabEl, scroll: 0, canBack: false };
+    // source: texto actual (con \n) · saved: lo que hay en disco · eol: fin de línea original
+    t = { id, host: '', name: '', path: '', el, tabEl, scroll: 0, canBack: false,
+      source: '', saved: '', eol: '\n', editing: false, ta: null, dirty: false, conflict: null, timer: 0, savedAt: 0 };
     tabs.set(id, t);
     return t;
   }
@@ -340,6 +342,7 @@
     t.tabEl.setAttribute('aria-selected', 'true');
     t.tabEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     buildToc(t.el);
+    applyEdit(t);
     scrollTo(0, t.scroll);
     document.title = t.name;
     $('btnBack').hidden = !t.canBack;
@@ -348,11 +351,16 @@
     syncTree();
   }
 
-  function closeTab(id) {
+  function closeTab(id, force) {
     const t = tabs.get(id);
     if (!t) return;
+    if (t.ta) refreshPreview(t);
+    // Con cambios sin guardar, la app pregunta (Guardar / No guardar / Cancelar).
+    if (!force && t.dirty) { activate(id); send({ type: 'askClose', tab: id }); return; }
     const order = [...tabs.keys()];
     const idx = order.indexOf(id);
+    clearTimeout(t.timer);
+    if (t.ta) t.ta.remove();
     t.el.remove();
     t.tabEl.remove();
     tabs.delete(id);
@@ -369,6 +377,7 @@
     active = null;
     empty.hidden = false;
     buildToc(null);
+    applyEdit(null);
     $('btnBack').hidden = true;
     document.title = 'Lector MD';
     scrollTo(0, 0);
@@ -504,29 +513,50 @@
     });
   }
 
+  const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
+
+  // Se sanea y procesa en un fragmento inerte (nada se descarga) y solo después se inserta en la página.
+  function paint(t, text) {
+    let frontMatter = '';
+    const fm = text.match(FRONT_MATTER);
+    if (fm) { frontMatter = fm[1]; text = text.slice(fm[0].length); }
+    const frag = DOMPurify.sanitize(marked.parse(text), PURIFY_FRAGMENT);
+    postProcess(frag, t.base, frontMatter, t.path);
+    t.el.replaceChildren(frag);
+  }
+
   function render(msg) {
     const t = ensureTab(msg.tab);
     const isActive = active === t.id;
-    const ratio = msg.keepScroll && isActive ? scrollY / Math.max(1, root.scrollHeight - innerHeight) : null;
-
-    let text = String(msg.text || '').replace(/^﻿/, '');
-    let frontMatter = '';
-    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/);
-    if (fm) { frontMatter = fm[1]; text = text.slice(fm[0].length); }
-
-    const navigated = t.path && t.path !== msg.path;
+    const raw = String(msg.text || '').replace(/^﻿/, '');
+    const text = raw.replace(/\r\n?/g, '\n');
+    const navigated = !!t.path && t.path !== msg.path;
     t.base = msg.base;
-    t.name = msg.name;
-    t.path = msg.path;
     t.dir = msg.dir;
     t.canBack = !!msg.canBack;
+
+    if (!navigated && t.dirty) {
+      // Lo que estás escribiendo nunca se pisa: si el disco trae otra cosa, se avisa.
+      if (text !== t.saved) t.conflict = text;
+      if (msg.activate) activate(t.id); else if (isActive) updateConflict();
+      return;
+    }
+    // Eco del propio guardado (o el archivo no cambió mientras editas): nada que hacer.
+    if (!navigated && (t.editing || Date.now() - t.savedAt < 3000) && text === t.source && t.el.firstChild) {
+      if (msg.activate) activate(t.id);
+      return;
+    }
+
+    const ratio = msg.keepScroll && isActive ? scrollY / Math.max(1, root.scrollHeight - innerHeight) : null;
+    t.name = msg.name;
+    t.path = msg.path;
     t.tabEl.querySelector('.name').textContent = msg.name;
     t.tabEl.title = msg.path;
-
-    // Se sanea y procesa en un fragmento inerte (nada se descarga) y solo después se inserta en la página.
-    const frag = DOMPurify.sanitize(marked.parse(text), PURIFY_FRAGMENT);
-    postProcess(frag, msg.base, frontMatter, msg.path);
-    t.el.replaceChildren(frag);
+    t.eol = /\r\n/.test(raw) ? '\r\n' : '\n';
+    t.saved = t.source = text;
+    t.conflict = null;
+    if (t.ta && t.ta.value !== text) setEditorText(t, text);
+    paint(t, text);
     if (!msg.keepScroll || navigated) t.scroll = 0;
 
     if (msg.activate || isActive) {
@@ -538,6 +568,228 @@
         requestAnimationFrame(() => scrollToId(msg.hash));
       }
     }
+  }
+
+  /* ---------------- editor ---------------- */
+  // Texto a la izquierda y vista previa en vivo a la derecha. Caja de texto nativa: deshacer, buscar y
+  // corrector vienen de serie. La página solo envía el texto; la app decide dónde se escribe.
+  const editorBox = $('editor');
+
+  function setDirty(t, d, force) {
+    if (t.dirty === d && !force) return;
+    t.dirty = d;
+    t.tabEl.classList.toggle('dirty', d);
+    if (t.id === active) $('btnSave').hidden = !d;
+    send({ type: 'dirty', tab: t.id, dirty: d });
+  }
+
+  function setEditorText(t, text) {
+    const ta = t.ta, s = ta.selectionStart, e = ta.selectionEnd, top = ta.scrollTop;
+    ta.value = text;
+    ta.setSelectionRange(Math.min(s, text.length), Math.min(e, text.length));
+    ta.scrollTop = top;
+  }
+
+  function createEditor(t) {
+    const ta = document.createElement('textarea');
+    ta.spellcheck = true;
+    ta.lang = 'es';
+    ta.hidden = true;
+    ta.setAttribute('aria-label', 'Texto Markdown de ' + t.name);
+    ta.value = t.source;
+    ta.addEventListener('input', () => {
+      setDirty(t, true);
+      // La vista previa se rehace tras una pausa (más larga cuanto mayor el documento).
+      clearTimeout(t.timer);
+      t.timer = setTimeout(() => refreshPreview(t), Math.min(800, 120 + ta.value.length / 4000));
+    });
+    ta.addEventListener('keydown', (e) => onEditorKey(e, ta));
+    ta.addEventListener('scroll', () => syncScroll(t), { passive: true });
+    editorBox.appendChild(ta);
+    t.ta = ta;
+  }
+
+  function refreshPreview(t) {
+    clearTimeout(t.timer);
+    if (!t.ta || t.ta.value === t.source) { if (t.ta) setDirty(t, t.source !== t.saved); return; }
+    t.source = t.ta.value;
+    setDirty(t, t.source !== t.saved); // deshacer hasta lo guardado quita la marca
+    const y = scrollY;
+    paint(t, t.source);
+    if (t.id === active) { buildToc(t.el); scrollTo(0, y); }
+  }
+
+  function syncScroll(t) {
+    if (t.id !== active || !t.editing) return;
+    const ta = t.ta, max = ta.scrollHeight - ta.clientHeight;
+    scrollTo(0, (max > 0 ? ta.scrollTop / max : 0) * Math.max(0, root.scrollHeight - innerHeight));
+  }
+
+  function applyEdit(t) {
+    const on = !!(t && t.editing);
+    document.body.classList.toggle('editing', on);
+    for (const x of tabs.values()) if (x.ta) x.ta.hidden = !(on && x === t);
+    const b = $('btnEdit');
+    b.hidden = !t;
+    b.setAttribute('aria-pressed', String(on));
+    b.title = on ? 'Terminar de editar (Ctrl+E)' : 'Editar (Ctrl+E)';
+    $('btnSave').hidden = !(t && t.dirty);
+    updateConflict();
+    if (on) t.ta.focus({ preventScroll: true });
+  }
+
+  function toggleEdit() {
+    const t = tabs.get(active);
+    if (!t) return;
+    if (!t.ta) createEditor(t);
+    if (t.editing) refreshPreview(t);
+    t.editing = !t.editing;
+    applyEdit(t);
+    if (t.editing) syncScroll(t);
+  }
+
+  function updateConflict() {
+    const t = tabs.get(active);
+    $('conflict').hidden = !(t && t.conflict !== null);
+  }
+  $('conflictLoad').addEventListener('click', () => {
+    const t = tabs.get(active);
+    if (!t || t.conflict === null) return;
+    t.saved = t.source = t.conflict;
+    t.conflict = null;
+    if (t.ta) setEditorText(t, t.source);
+    setDirty(t, false);
+    paint(t, t.source);
+    buildToc(t.el);
+    updateConflict();
+  });
+  $('conflictKeep').addEventListener('click', () => {
+    const t = tabs.get(active);
+    if (!t || t.conflict === null) return;
+    t.saved = t.conflict; // lo del disco pasa a ser la referencia; al guardar, se sobrescribe con lo tuyo
+    t.conflict = null;
+    setDirty(t, t.source !== t.saved);
+    updateConflict();
+  });
+
+  function save(t, then) {
+    if (!t) return;
+    if (t.ta) refreshPreview(t);
+    if (!t.dirty && !then) { toast('Sin cambios que guardar'); return; }
+    t.pendingSave = t.source;
+    send({ type: 'save', tab: t.id, text: t.eol === '\n' ? t.source : t.source.replace(/\n/g, t.eol), then: then || '' });
+  }
+
+  function onSaved(m) {
+    const t = tabs.get(m.tab);
+    if (!t) return;
+    if (m.ok) {
+      t.saved = t.pendingSave;
+      t.savedAt = Date.now();
+      t.conflict = null;
+      // Si se siguió escribiendo durante el guardado, la marca se mantiene (y la app lo sabe).
+      setDirty(t, (t.ta ? t.ta.value : t.source) !== t.saved, true);
+      if (t.id === active) updateConflict();
+      toast('Guardado');
+    } else if (!m.cancelled) {
+      toast('No se pudo guardar: ' + (m.error || 'error desconocido'));
+    }
+  }
+
+  function saveAll() {
+    let n = 0;
+    for (const t of tabs.values()) {
+      if (t.ta) refreshPreview(t);
+      if (t.dirty) { save(t, 'quit'); n++; }
+    }
+    if (!n) send({ type: 'close' });
+  }
+
+  // --- ayudas de escritura (todas pasan por insertText: Ctrl+Z las deshace) ---
+  function insert(ta, text) {
+    ta.focus();
+    if (!document.execCommand('insertText', false, text)) {
+      ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end');
+      ta.dispatchEvent(new Event('input'));
+    }
+  }
+
+  function wrap(ta, mark) {
+    const s = ta.selectionStart, e = ta.selectionEnd, sel = ta.value.slice(s, e);
+    if (sel.length >= 2 * mark.length && sel.startsWith(mark) && sel.endsWith(mark)) {
+      insert(ta, sel.slice(mark.length, sel.length - mark.length));
+      ta.setSelectionRange(s, e - 2 * mark.length);
+      return;
+    }
+    const body = sel || 'texto';
+    insert(ta, mark + body + mark);
+    ta.setSelectionRange(s + mark.length, s + mark.length + body.length);
+  }
+
+  function link(ta) {
+    const s = ta.selectionStart, label = ta.value.slice(s, ta.selectionEnd) || 'texto';
+    insert(ta, '[' + label + '](url)');
+    const u = s + label.length + 3;
+    ta.setSelectionRange(u, u + 3);
+  }
+
+  const LIST_ITEM = /^(\s*)([-*+]|(\d+)([.)]))(\s+)(\[[ xX]\]\s+)?/;
+
+  function indent(ta, out) {
+    const v = ta.value, s = ta.selectionStart, e = ta.selectionEnd;
+    const ls = v.lastIndexOf('\n', s - 1) + 1;
+    let le = v.indexOf('\n', e > s && v[e - 1] === '\n' ? e - 1 : e);
+    if (le < 0) le = v.length;
+    const block = v.slice(ls, le);
+    if (!out && s === e && !LIST_ITEM.test(block)) { insert(ta, '  '); return; }
+    const lines = block.split('\n');
+    const next = lines.map((l) => (out ? l.replace(/^( {1,2}|\t)/, '') : '  ' + l));
+    const joined = next.join('\n');
+    if (joined === block) return;
+    ta.setSelectionRange(ls, le);
+    insert(ta, joined);
+    if (s === e) {
+      const p = Math.max(ls, s + next[0].length - lines[0].length);
+      ta.setSelectionRange(p, p);
+    } else ta.setSelectionRange(ls, ls + joined.length);
+  }
+
+  // Intro dentro de una lista: continúa con la siguiente viñeta; en una viñeta vacía, termina la lista.
+  function newline(ta) {
+    const v = ta.value, s = ta.selectionStart;
+    if (s !== ta.selectionEnd) return false;
+    const ls = v.lastIndexOf('\n', s - 1) + 1;
+    const line = v.slice(ls, s);
+    const m = line.match(LIST_ITEM);
+    if (!m) return false;
+    const eol = v.indexOf('\n', s);
+    if (line.length === m[0].length && !v.slice(s, eol < 0 ? v.length : eol).trim()) {
+      ta.setSelectionRange(ls, s);
+      document.execCommand('delete');
+      return true;
+    }
+    const bullet = m[3] ? (Number(m[3]) + 1) + m[4] : m[2];
+    insert(ta, '\n' + m[1] + bullet + m[5] + (m[6] ? '[ ] ' : ''));
+    return true;
+  }
+
+  function onEditorKey(e, ta) {
+    const k = e.key.toLowerCase(), ctrl = e.ctrlKey && !e.shiftKey && !e.altKey;
+    let done = true;
+    if (ctrl && k === 'b') wrap(ta, '**');
+    else if (ctrl && k === 'i') wrap(ta, '*');
+    else if (ctrl && k === 'k') link(ta);
+    else if (k === 'tab' && !e.ctrlKey && !e.altKey) indent(ta, e.shiftKey);
+    else if (k === 'enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.isComposing) done = newline(ta);
+    else done = false;
+    if (done) { e.preventDefault(); e.stopPropagation(); }
+  }
+
+  function goBack() {
+    const t = tabs.get(active);
+    if (!t) return;
+    if (t.dirty) { toast('Guarda los cambios antes de volver atrás'); return; }
+    send({ type: 'back', tab: t.id });
   }
 
   /* ---------------- enlaces ---------------- */
@@ -562,7 +814,7 @@
   document.addEventListener('auxclick', (e) => { if (e.button === 1) onLink(e, true); });
   document.addEventListener('mousedown', (e) => { if (e.button === 1 && e.target.closest('a[href]')) e.preventDefault(); });
   document.addEventListener('mouseup', (e) => {
-    if (e.button === 3 && active !== null) { e.preventDefault(); send({ type: 'back', tab: active }); }
+    if (e.button === 3 && active !== null) { e.preventDefault(); goBack(); }
   });
 
   /* ---------------- teclado ---------------- */
@@ -571,7 +823,9 @@
     if (e.ctrlKey && k === 'o') { e.preventDefault(); send({ type: 'open' }); }
     else if (e.ctrlKey && k === 'b') { e.preventDefault(); toggleToc(); }
     else if (k === 'f5' || (e.ctrlKey && k === 'r')) { e.preventDefault(); if (active !== null) send({ type: 'reload', tab: active }); }
-    else if (e.altKey && k === 'arrowleft') { e.preventDefault(); if (active !== null) send({ type: 'back', tab: active }); }
+    else if (e.altKey && k === 'arrowleft') { e.preventDefault(); goBack(); }
+    else if (e.ctrlKey && !e.shiftKey && k === 'e') { e.preventDefault(); toggleEdit(); }
+    else if (e.ctrlKey && !e.shiftKey && k === 's') { e.preventDefault(); save(tabs.get(active)); }
     else if (e.ctrlKey && (k === 'w' || k === 'f4')) { e.preventDefault(); if (active !== null) closeTab(active); else send({ type: 'close' }); }
     else if (e.ctrlKey && k === 'tab') { e.preventDefault(); cycle(e.shiftKey ? -1 : 1); }
     else if (e.ctrlKey && k === 'pagedown') { e.preventDefault(); cycle(1); }
@@ -589,7 +843,9 @@
   /* ---------------- varios ---------------- */
   $('btnNew').addEventListener('click', () => send({ type: 'open' }));
   $('btnOpenBig').addEventListener('click', () => send({ type: 'open' }));
-  $('btnBack').addEventListener('click', () => { if (active !== null) send({ type: 'back', tab: active }); });
+  $('btnBack').addEventListener('click', goBack);
+  $('btnEdit').addEventListener('click', toggleEdit);
+  $('btnSave').addEventListener('click', () => save(tabs.get(active)));
   $('bar').addEventListener('dblclick', (e) => { if (e.target === $('bar') || e.target === tabsBar) send({ type: 'open' }); });
 
   let dragDepth = 0;
@@ -612,6 +868,10 @@
       const m = e.data;
       if (m && m.type === 'doc') render(m);
       else if (m && m.type === 'dir') tree.onDir(m);
+      else if (m && m.type === 'saved') onSaved(m);
+      else if (m && m.type === 'saveTab') save(tabs.get(m.tab), m.then);
+      else if (m && m.type === 'saveAll') saveAll();
+      else if (m && m.type === 'closeTabNow') closeTab(m.tab, true);
     });
   }
   applyTheme();

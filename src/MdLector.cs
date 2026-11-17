@@ -17,7 +17,7 @@ using Microsoft.Web.WebView2.WinForms;
 
 [assembly: System.Reflection.AssemblyTitle("Lector MD")]
 [assembly: System.Reflection.AssemblyProduct("Lector MD")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
 
 namespace MdLector
 {
@@ -85,6 +85,9 @@ namespace MdLector
         public int Retries;
         public readonly List<string> History = new List<string>();
         public FileSystemWatcher Watcher;
+        public Encoding Enc;          // codificación con la que se leyó (se respeta al guardar)
+        public DateTime StampTime;    // estado del archivo en disco la última vez que se leyó o guardó
+        public long StampLen;
         public string Host { get { return "t" + Id + ".mdlector"; } }
     }
 
@@ -104,9 +107,10 @@ namespace MdLector
         readonly HashSet<int> dirty = new HashSet<int>();
         readonly System.Windows.Forms.Timer reloadTimer = new System.Windows.Forms.Timer { Interval = 250 };
         readonly List<string> pending = new List<string>();
+        readonly HashSet<int> unsaved = new HashSet<int>(); // pestañas con cambios sin guardar
         int nextId = 1;
         Tab active;
-        bool ready;
+        bool ready, closeConfirmed;
 
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -146,7 +150,32 @@ namespace MdLector
                 if (serve) new Thread(PipeLoop) { IsBackground = true }.Start();
             };
             Load += async delegate { await Init(); };
-            FormClosing += delegate { SaveWindow(); };
+            FormClosing += OnClosing;
+        }
+
+        void OnClosing(object sender, FormClosingEventArgs e)
+        {
+            if (!closeConfirmed && unsaved.Count > 0 && e.CloseReason != CloseReason.WindowsShutDown)
+            {
+                var r = MessageBox.Show(this, unsaved.Count == 1
+                        ? "Hay un documento con cambios sin guardar.\n\n¿Guardarlo antes de salir?"
+                        : "Hay " + unsaved.Count + " documentos con cambios sin guardar.\n\n¿Guardarlos antes de salir?",
+                    "Lector MD", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+                if (r == DialogResult.Cancel) { e.Cancel = true; return; }
+                if (r == DialogResult.Yes)
+                {
+                    // Se piden los textos a la página; al terminar de guardar todo, se cierra.
+                    e.Cancel = true;
+                    Post(new Dictionary<string, object> { { "type", "saveAll" } });
+                    return;
+                }
+            }
+            SaveWindow();
+        }
+
+        void Post(Dictionary<string, object> data)
+        {
+            if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(json.Serialize(data));
         }
 
         // ---------- instancia única ----------
@@ -369,7 +398,7 @@ namespace MdLector
                 case "open": ShowOpenDialog(); break;
                 case "activate":
                     active = tab;
-                    Text = tab != null && tab.Path != null ? Path.GetFileName(tab.Path) + " — Lector MD" : "Lector MD";
+                    UpdateTitle();
                     break;
                 case "closeTab":
                     if (tab != null) CloseTab(tab);
@@ -378,7 +407,7 @@ namespace MdLector
                     if (tab != null && tab.Path != null) LoadIntoTab(tab, tab.Path, true, null, false);
                     break;
                 case "back":
-                    if (tab != null && tab.History.Count > 0)
+                    if (tab != null && tab.History.Count > 0 && !unsaved.Contains(tab.Id))
                     {
                         string prev = tab.History[tab.History.Count - 1];
                         tab.History.RemoveAt(tab.History.Count - 1);
@@ -400,7 +429,114 @@ namespace MdLector
                     string ex = Str(msg, "path");
                     if (Directory.Exists(ex)) Explorer("\"" + ex + "\"");
                     break;
+                case "dirty":
+                    if (tab == null) break;
+                    if (Str(msg, "dirty") == "True") unsaved.Add(tab.Id); else unsaved.Remove(tab.Id);
+                    if (tab == active) UpdateTitle();
+                    break;
+                case "save": SaveTab(tab, Str(msg, "text"), Str(msg, "then")); break;
+                case "askClose":
+                    if (tab == null || tab.Path == null) break;
+                    var answer = MessageBox.Show(this, "¿Guardar los cambios en «" + Path.GetFileName(tab.Path) + "»?",
+                        "Lector MD", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+                    if (answer == DialogResult.Yes)
+                        Post(new Dictionary<string, object> { { "type", "saveTab" }, { "tab", tab.Id }, { "then", "closeTab" } });
+                    else if (answer == DialogResult.No)
+                        Post(new Dictionary<string, object> { { "type", "closeTabNow" }, { "tab", tab.Id } });
+                    break;
             }
+        }
+
+        void UpdateTitle()
+        {
+            Text = active != null && active.Path != null
+                ? (unsaved.Contains(active.Id) ? "● " : "") + Path.GetFileName(active.Path) + " — Lector MD"
+                : "Lector MD";
+        }
+
+        // ---------- edición ----------
+        // Solo se escribe en el archivo de la propia pestaña: la página nunca elige la ruta.
+        void SaveTab(Tab tab, string text, string then)
+        {
+            if (tab == null || tab.Path == null) return;
+            var res = new Dictionary<string, object> { { "type", "saved" }, { "tab", tab.Id }, { "ok", false } };
+            try
+            {
+                if (text.Length > MaxFileBytes) throw new IOException("El documento supera 8 MB.");
+                var fi = new FileInfo(tab.Path);
+                if (fi.Exists && (fi.LastWriteTimeUtc != tab.StampTime || fi.Length != tab.StampLen) &&
+                    MessageBox.Show(this, "«" + fi.Name + "» ha cambiado en el disco desde que lo abriste.\n\n" +
+                        "¿Sobrescribirlo con tu versión?", "Lector MD", MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                {
+                    res["cancelled"] = true;
+                    Post(res);
+                    return;
+                }
+                WriteAtomic(tab.Path, Encode(tab, text));
+                SetStamp(tab);
+                unsaved.Remove(tab.Id);
+                res["ok"] = true;
+            }
+            catch (Exception ex) { res["error"] = ex.Message; }
+            Post(res);
+            if (tab == active) UpdateTitle();
+            if (!(bool)res["ok"]) return;
+            if (then == "closeTab") Post(new Dictionary<string, object> { { "type", "closeTabNow" }, { "tab", tab.Id } });
+            else if (then == "quit" && unsaved.Count == 0) { closeConfirmed = true; BeginInvoke((Action)Close); }
+        }
+
+        // Misma codificación que el original; si un carácter no cabe en ella (ANSI), se pasa a UTF-8.
+        static byte[] Encode(Tab tab, string text)
+        {
+            Encoding enc = tab.Enc ?? new UTF8Encoding(false);
+            byte[] body;
+            try
+            {
+                var strict = (Encoding)enc.Clone();
+                strict.EncoderFallback = EncoderFallback.ExceptionFallback;
+                body = strict.GetBytes(text);
+            }
+            catch (EncoderFallbackException)
+            {
+                enc = new UTF8Encoding(false);
+                body = enc.GetBytes(text);
+            }
+            tab.Enc = enc;
+            byte[] pre = enc.GetPreamble();
+            if (pre.Length == 0) return body;
+            var all = new byte[pre.Length + body.Length];
+            Buffer.BlockCopy(pre, 0, all, 0, pre.Length);
+            Buffer.BlockCopy(body, 0, all, pre.Length, body.Length);
+            return all;
+        }
+
+        // Se escribe en un temporal y se sustituye: un corte a mitad no deja el documento a medias.
+        static void WriteAtomic(string path, byte[] bytes)
+        {
+            string tmp = Path.Combine(Path.GetDirectoryName(path),
+                "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
+            try
+            {
+                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024))
+                {
+                    fs.Write(bytes, 0, bytes.Length);
+                    fs.Flush(true);
+                }
+                if (File.Exists(path)) File.Replace(tmp, path, null, true); else File.Move(tmp, path);
+            }
+            catch
+            {
+                try { File.Delete(tmp); } catch { }
+                // Algunas unidades (red, FAT, carpetas sin permiso de creación) no lo admiten: escritura directa.
+                File.WriteAllBytes(path, bytes);
+            }
+        }
+
+        static void SetStamp(Tab tab)
+        {
+            try { var fi = new FileInfo(tab.Path); tab.StampTime = fi.LastWriteTimeUtc; tab.StampLen = fi.Length; }
+            catch { }
         }
 
         // ---------- árbol de carpetas ----------
@@ -508,6 +644,8 @@ namespace MdLector
             }
             else if (target.Path != null && !SamePath(target.Path, path))
             {
+                // Con cambios sin guardar, el enlace se abre en otra pestaña para no perderlos.
+                if (unsaved.Contains(target.Id)) { OpenPath(path, null, hash); return; }
                 target.History.Add(target.Path);
             }
             LoadIntoTab(target, path, false, hash, true);
@@ -516,7 +654,8 @@ namespace MdLector
         void LoadIntoTab(Tab tab, string path, bool keepScroll, string hash, bool activate)
         {
             string text;
-            try { text = ReadText(path); tab.Retries = 0; }
+            Encoding enc;
+            try { text = ReadText(path, out enc); tab.Retries = 0; }
             catch (IOException)
             {
                 // Bloqueado mientras otro programa lo guarda: unos pocos reintentos y se deja.
@@ -543,6 +682,8 @@ namespace MdLector
                 tab.Path = path;
                 Watch(tab);
             }
+            tab.Enc = enc;
+            SetStamp(tab);
             var segs = new List<string>();
             foreach (string s in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
                 segs.Add(Uri.EscapeDataString(s));
@@ -567,6 +708,7 @@ namespace MdLector
         {
             tabs.Remove(tab.Id);
             dirty.Remove(tab.Id);
+            unsaved.Remove(tab.Id);
             if (tab.Watcher != null) { tab.Watcher.EnableRaisingEvents = false; tab.Watcher.Dispose(); }
             if (active == tab) active = null;
         }
@@ -578,7 +720,7 @@ namespace MdLector
 
         const long MaxFileBytes = 8L * 1024 * 1024;
 
-        static string ReadText(string path)
+        static string ReadText(string path, out Encoding enc)
         {
             byte[] bytes;
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -590,11 +732,13 @@ namespace MdLector
                 while (read < bytes.Length && (n = fs.Read(bytes, read, bytes.Length - read)) > 0) read += n;
                 if (read < bytes.Length) Array.Resize(ref bytes, read);
             }
-            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
-            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
-            int start = (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) ? 3 : 0;
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) { enc = Encoding.Unicode; return enc.GetString(bytes, 2, bytes.Length - 2); }
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) { enc = Encoding.BigEndianUnicode; return enc.GetString(bytes, 2, bytes.Length - 2); }
+            bool bom = bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
+            int start = bom ? 3 : 0;
+            enc = new UTF8Encoding(bom);
             try { return new UTF8Encoding(false, true).GetString(bytes, start, bytes.Length - start); }
-            catch (DecoderFallbackException) { return Encoding.Default.GetString(bytes); }
+            catch (DecoderFallbackException) { enc = Encoding.Default; return enc.GetString(bytes); }
         }
 
         void Watch(Tab tab)

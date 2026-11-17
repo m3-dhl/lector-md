@@ -156,6 +156,37 @@ button.icon:disabled { opacity: .35; cursor: default; background: transparent; }
   body.toc-open #view { padding-left: calc(280px + 28px); }
 }
 
+/* ---------- editor (texto a la izquierda, vista previa a la derecha) ---------- */
+@media (min-width: 800px) { body.toc-open { --side: 280px; } }
+#editor {
+  display: none; position: fixed; z-index: 10;
+  top: var(--bar-h); bottom: 0; left: var(--side, 0px);
+  width: calc((100vw - var(--side, 0px)) / 2);
+  background: var(--soft); border-right: 1px solid var(--line);
+}
+body.editing #editor { display: block; }
+body.editing #view { padding-left: calc(var(--side, 0px) + (100vw - var(--side, 0px)) / 2 + 28px); }
+#editor textarea {
+  display: block; width: 100%; height: 100%; margin: 0; border: 0; outline: 0; resize: none;
+  padding: 28px 26px 96px; background: transparent; color: var(--fg); caret-color: var(--accent);
+  font: 14px/1.65 "Cascadia Mono", Consolas, monospace; tab-size: 4;
+}
+@media (max-width: 799.98px) {
+  body.editing #editor { left: 0; width: auto; right: 0; }
+  body.editing #view { display: none; }
+}
+.tab.dirty .name::before { content: "● "; color: var(--accent); }
+#conflict {
+  position: fixed; top: calc(var(--bar-h) + 10px); left: 50%; transform: translateX(-50%); z-index: 25;
+  display: flex; align-items: center; gap: 10px; max-width: calc(100vw - 32px);
+  padding: 8px 10px 8px 14px; border-radius: 9px; font-size: 13.5px;
+  background: var(--bg); border: 1px solid var(--line); box-shadow: var(--shadow);
+}
+#conflict button {
+  font: inherit; font-weight: 600; padding: 4px 12px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--line); background: var(--soft); color: var(--fg);
+}
+
 /* ---------- vista ---------- */
 #view { min-height: 100%; padding: calc(var(--bar-h) + 40px) 28px 96px; transition: padding .18s ease; }
 .md { scroll-margin-top: var(--bar-h); }
@@ -273,8 +304,8 @@ kbd {
 ::-webkit-scrollbar-track { background: transparent; }
 
 @media print {
-  .tools, #toc, #toast { display: none !important; }
-  #view { padding: 0 !important; }
+  .tools, #toc, #toast, #editor, #conflict { display: none !important; }
+  #view { padding: 0 !important; display: block !important; }
   body { background: #fff; color: #000; }
   .md pre .copy { display: none; }
 }
