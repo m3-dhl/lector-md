@@ -68,7 +68,7 @@ $s.Save()
 New-Item $uninst -Force | Out-Null
 $size = [int]((Get-ChildItem $dest -Recurse | Measure-Object Length -Sum).Sum / 1KB)
 $props = @{
-  DisplayName = 'Lector MD'; DisplayVersion = '1.2.0'; Publisher = 'Local'; DisplayIcon = "`"$exe`",0"
+  DisplayName = 'Lector MD'; DisplayVersion = '1.3.0'; Publisher = 'Local'; DisplayIcon = "`"$exe`",0"
   InstallLocation = $dest; EstimatedSize = $size; NoModify = 1; NoRepair = 1
   UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$dest\install.ps1`" -Uninstall"
 }

@@ -242,6 +242,15 @@ kbd {
 .md details { border: 1px solid var(--line); border-radius: 8px; padding: .5em 1em; }
 .md summary { cursor: pointer; font-weight: 600; }
 .md details.frontmatter { font-size: .88em; color: var(--muted); }
+.md .remote-note {
+  display: flex; align-items: center; gap: 12px; justify-content: space-between;
+  margin: 0 0 1.4em; padding: 8px 10px 8px 14px; border-radius: 8px;
+  background: var(--soft); border: 1px solid var(--line); color: var(--muted); font-size: 13.5px;
+}
+.md .remote-note button {
+  font: inherit; font-weight: 600; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+}
 .md details.frontmatter pre { margin: .6em 0 .2em; }
 
 /* avisos estilo GitHub: > [!NOTE] */

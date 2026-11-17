@@ -5,6 +5,8 @@ using System.Drawing;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,16 +17,20 @@ using Microsoft.Web.WebView2.WinForms;
 
 [assembly: System.Reflection.AssemblyTitle("Lector MD")]
 [assembly: System.Reflection.AssemblyProduct("Lector MD")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
 
 namespace MdLector
 {
     static class Program
     {
-        public static readonly string PipeName = "MdLector-" + Environment.UserName;
+        // Una tubería por usuario y sesión de Windows.
+        public static readonly string PipeName = "MdLector-" + WindowsIdentity.GetCurrent().User.Value + "-" +
+            Process.GetCurrentProcess().SessionId;
 
         [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint pid);
 
         [STAThread]
         static void Main(string[] args)
@@ -45,12 +51,22 @@ namespace MdLector
         {
             try
             {
-                AllowSetForegroundWindow(-1);
                 var paths = new List<string>();
                 foreach (string a in args) { try { paths.Add(Path.GetFullPath(a)); } catch { } }
-                using (var c = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+                // Identification: el servidor no puede suplantarnos.
+                using (var c = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.None,
+                    TokenImpersonationLevel.Identification))
                 {
                     c.Connect(5000);
+                    // Solo se envía a otra copia de este mismo programa (evita que otro proceso ocupe la tubería).
+                    uint pid;
+                    if (!GetNamedPipeServerProcessId(c.SafePipeHandle, out pid)) return false;
+                    using (var server = Process.GetProcessById((int)pid))
+                    {
+                        if (!string.Equals(server.MainModule.FileName, Application.ExecutablePath,
+                            StringComparison.OrdinalIgnoreCase)) return false;
+                    }
+                    AllowSetForegroundWindow((int)pid);
                     byte[] data = Encoding.UTF8.GetBytes(string.Join("\n", paths.ToArray()));
                     c.Write(data, 0, data.Length);
                     c.Flush();
@@ -65,6 +81,8 @@ namespace MdLector
     {
         public int Id;
         public string Path;
+        public string Root;
+        public int Retries;
         public readonly List<string> History = new List<string>();
         public FileSystemWatcher Watcher;
         public string Host { get { return "t" + Id + ".mdlector"; } }
@@ -80,6 +98,7 @@ namespace MdLector
         static readonly string WindowFile = Path.Combine(DataDir, "window.txt");
 
         readonly WebView2 web;
+        readonly Task<CoreWebView2Environment> envTask;
         readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
         readonly Dictionary<int, Tab> tabs = new Dictionary<int, Tab>();
         readonly HashSet<int> dirty = new HashSet<int>();
@@ -103,6 +122,9 @@ namespace MdLector
 
             bool dark = SystemIsDark();
             BackColor = dark ? Color.FromArgb(27, 29, 33) : Color.FromArgb(251, 251, 250);
+
+            // El motor arranca ya, en paralelo con la creación de la ventana.
+            envTask = CreateEnvironment();
 
             web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = BackColor };
             Controls.Add(web);
@@ -130,39 +152,71 @@ namespace MdLector
         // ---------- instancia única ----------
         void PipeLoop()
         {
-            while (true)
+            // Solo el usuario actual puede conectarse a la tubería.
+            var security = new PipeSecurity();
+            security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User,
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            const int MaxMessage = 64 * 1024;
+            int failures = 0;
+            while (failures < 20)
             {
                 try
                 {
-                    using (var s = new NamedPipeServerStream(Program.PipeName, PipeDirection.In, 1))
+                    using (var s = new NamedPipeServerStream(Program.PipeName, PipeDirection.In, 1,
+                        PipeTransmissionMode.Byte, PipeOptions.None, 0, 0, security))
                     {
                         s.WaitForConnection();
-                        string data;
-                        using (var r = new StreamReader(s, Encoding.UTF8)) data = r.ReadToEnd();
+                        var buf = new byte[MaxMessage];
+                        int total = 0, n;
+                        while (total < MaxMessage && (n = s.Read(buf, total, MaxMessage - total)) > 0) total += n;
+                        string data = Encoding.UTF8.GetString(buf, 0, total);
                         BeginInvoke((Action)(() => ReceiveExternal(data)));
+                        failures = 0;
                     }
                 }
-                catch { Thread.Sleep(300); }
+                catch { failures++; Thread.Sleep(500); }
             }
         }
 
         void ReceiveExternal(string data)
         {
             foreach (string p in data.Split('\n'))
-                if (p.Trim().Length > 0) OpenPath(p.Trim(), null, null);
+                if (p.Trim().Length > 0 && IsMarkdown(p.Trim())) OpenPath(p.Trim(), null, null);
             if (WindowState == FormWindowState.Minimized) ShowWindow(Handle, 9);
             Activate();
             SetForegroundWindow(Handle);
         }
 
         // ---------- motor ----------
-        async Task Init()
+        // Menos procesos y memoria; sin servicios de red que un lector local no necesita.
+        const string BrowserArgs =
+            "--disable-gpu --in-process-gpu --renderer-process-limit=1 " +
+            "--enable-features=NetworkServiceInProcess2 " +
+            "--disable-background-networking --disable-component-update " +
+            "--auth-server-allowlist=_ " + // nunca enviar credenciales de Windows (NTLM/Kerberos) a ningún servidor
+            "--disable-features=msSmartScreenProtection,AutofillServerCommunication,OptimizationHints,Translate,SpareRendererForSitePerProcess";
+
+        static Task<CoreWebView2Environment> CreateEnvironment()
         {
             try
             {
                 Directory.CreateDirectory(DataDir);
-                var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"));
-                await web.EnsureCoreWebView2Async(env);
+                return CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"),
+                    new CoreWebView2EnvironmentOptions(BrowserArgs));
+            }
+            catch (Exception ex)
+            {
+                var tcs = new TaskCompletionSource<CoreWebView2Environment>();
+                tcs.SetException(ex);
+                return tcs.Task;
+            }
+        }
+
+        async Task Init()
+        {
+            try
+            {
+                await web.EnsureCoreWebView2Async(await envTask);
             }
             catch (Exception ex)
             {
@@ -173,12 +227,35 @@ namespace MdLector
             }
 
             var c = web.CoreWebView2;
-            c.Settings.AreDevToolsEnabled = false;
-            c.Settings.IsStatusBarEnabled = false;
-            c.Settings.IsZoomControlEnabled = true;
-            c.Settings.AreBrowserAcceleratorKeysEnabled = true;
+            var st = c.Settings;
+            st.AreDevToolsEnabled = false;
+            st.IsStatusBarEnabled = false;
+            st.IsZoomControlEnabled = true;
+            st.AreBrowserAcceleratorKeysEnabled = true;
+            st.AreHostObjectsAllowed = false;
+            st.AreDefaultScriptDialogsEnabled = false;
+            st.IsPasswordAutosaveEnabled = false;
+            st.IsGeneralAutofillEnabled = false;
+            st.IsReputationCheckingRequired = false; // solo contenido local; los enlaces web van al navegador
             c.SetVirtualHostNameToFolderMapping(AppHost, Path.Combine(BaseDir, "web"),
                 CoreWebView2HostResourceAccessKind.Deny);
+
+            // Nada de descargas, permisos (cámara, ubicación…) ni ventanas nuevas dentro de la app.
+            c.DownloadStarting += delegate(object s, CoreWebView2DownloadStartingEventArgs e) { e.Cancel = true; };
+            c.PermissionRequested += delegate(object s, CoreWebView2PermissionRequestedEventArgs e)
+            {
+                e.State = CoreWebView2PermissionState.Deny;
+            };
+            Resize += delegate
+            {
+                // Minimizada: el motor libera memoria.
+                try
+                {
+                    c.MemoryUsageTargetLevel = WindowState == FormWindowState.Minimized
+                        ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal;
+                }
+                catch { }
+            };
 
             c.NavigationStarting += OnNavigationStarting;
             c.NewWindowRequested += delegate(object s, CoreWebView2NewWindowRequestedEventArgs e)
@@ -187,13 +264,81 @@ namespace MdLector
                 HandleLink(active, e.Uri, true);
             };
             c.WebMessageReceived += OnMessage;
-            c.Navigate("https://" + AppHost + "/index.html");
+            // Imágenes de los documentos: las sirve la app (no hay carpeta mapeada al motor web).
+            // Filtro "All": cualquier petición a *.mdlector se responde aquí (sin tocar la red ni el DNS);
+            // solo las imágenes reciben contenido, el resto 404.
+            c.AddWebResourceRequestedFilter("https://*.mdlector/*", CoreWebView2WebResourceContext.All);
+            c.WebResourceRequested += OnImageRequested;
+            c.Navigate(AppPage);
+        }
+
+        const string AppPage = "https://" + AppHost + "/index.html";
+        bool pageLoaded;
+
+        static readonly Dictionary<string, string> ImageTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { ".png", "image/png" }, { ".jpg", "image/jpeg" }, { ".jpeg", "image/jpeg" }, { ".gif", "image/gif" },
+            { ".webp", "image/webp" }, { ".bmp", "image/bmp" }, { ".svg", "image/svg+xml" }, { ".ico", "image/x-icon" },
+            { ".avif", "image/avif" }
+        };
+        const long MaxImageBytes = 64L * 1024 * 1024;
+
+        void OnImageRequested(object sender, CoreWebView2WebResourceRequestedEventArgs e)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out uri) ||
+                uri.Host.Equals(AppHost, StringComparison.OrdinalIgnoreCase)) return;
+
+            var env = web.CoreWebView2.Environment;
+            Tab tab = null;
+            foreach (Tab t in tabs.Values)
+                if (uri.Host.Equals(t.Host, StringComparison.OrdinalIgnoreCase)) { tab = t; break; }
+
+            string root = tab != null ? tab.Root : null;
+            string urlPath = uri.AbsolutePath;
+            if (root == null) { e.Response = env.CreateWebResourceResponse(null, 404, "Not Found", ""); return; }
+
+            // El disco (o una unidad de red lenta) se consulta fuera del hilo de la interfaz.
+            var deferral = e.GetDeferral();
+            Task.Run(() =>
+            {
+                string type;
+                string local = ResolveInRoot(root, urlPath);
+                if (local == null || !ImageTypes.TryGetValue(Path.GetExtension(local) ?? "", out type)) return null;
+                try
+                {
+                    var fs = new FileStream(local, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                        64 * 1024, FileOptions.SequentialScan);
+                    if (fs.Length <= MaxImageBytes) return Tuple.Create((Stream)fs, type);
+                    fs.Dispose();
+                }
+                catch { }
+                return null;
+            }).ContinueWith(t =>
+            {
+                try
+                {
+                    var r = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
+                    e.Response = r != null
+                        ? env.CreateWebResourceResponse(r.Item1, 200, "OK",
+                            "Content-Type: " + r.Item2 + "\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache")
+                        : env.CreateWebResourceResponse(null, 404, "Not Found", "");
+                }
+                catch { }
+                finally { deferral.Complete(); }
+            }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         void OnNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
         {
-            if (e.Uri.StartsWith("https://" + AppHost + "/", StringComparison.OrdinalIgnoreCase)) return;
+            // La única navegación permitida es la carga inicial de la interfaz.
+            if (string.Equals(e.Uri, AppPage, StringComparison.OrdinalIgnoreCase) && !pageLoaded)
+            {
+                pageLoaded = true;
+                return;
+            }
             e.Cancel = true;
+            if (e.Uri.StartsWith("https://" + AppHost + "/", StringComparison.OrdinalIgnoreCase)) return;
             if (e.Uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
             {
                 string local = new Uri(e.Uri).LocalPath;
@@ -205,6 +350,7 @@ namespace MdLector
 
         void OnMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
+            if (!string.Equals(e.Source, AppPage, StringComparison.OrdinalIgnoreCase)) return;
             Dictionary<string, object> msg;
             try { msg = json.Deserialize<Dictionary<string, object>>(e.TryGetWebMessageAsString()); }
             catch { return; }
@@ -243,19 +389,34 @@ namespace MdLector
                 case "close": Close(); break;
                 case "theme": SetDarkTitle(Str(msg, "dark") == "True"); break;
                 case "folder":
-                    if (tab != null && tab.Path != null) Process.Start("explorer.exe", "/select,\"" + tab.Path + "\"");
+                    if (tab != null && tab.Path != null) Explorer("/select,\"" + tab.Path + "\"");
                     break;
                 case "listDir": SendDir(Str(msg, "path"), Str(msg, "req")); break;
-                case "openFile": OpenPath(Str(msg, "path"), null, null); break;
+                case "openFile":
+                    string of = Str(msg, "path");
+                    if (IsMarkdown(of)) OpenPath(of, null, null);
+                    break;
                 case "explore":
                     string ex = Str(msg, "path");
-                    if (Directory.Exists(ex)) Process.Start("explorer.exe", "\"" + ex + "\"");
+                    if (Directory.Exists(ex)) Explorer("\"" + ex + "\"");
                     break;
             }
         }
 
         // ---------- árbol de carpetas ----------
+        // Se lista en segundo plano: una carpeta lenta o enorme no congela la ventana.
         void SendDir(string path, string req)
+        {
+            Task.Run(() => new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(BuildDir(path, req)))
+                .ContinueWith(t =>
+                {
+                    if (t.Status != TaskStatus.RanToCompletion || IsDisposed) return;
+                    try { BeginInvoke((Action)(() => { if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(t.Result); })); }
+                    catch (InvalidOperationException) { }
+                });
+        }
+
+        static Dictionary<string, object> BuildDir(string path, string req)
         {
             var data = new Dictionary<string, object>();
             data["type"] = "dir";
@@ -271,26 +432,40 @@ namespace MdLector
                 data["parent"] = info.Parent != null ? info.Parent.FullName : null;
                 data["name"] = info.Parent != null ? info.Name : info.FullName;
 
-                var subdirs = info.GetDirectories();
-                Array.Sort(subdirs, (a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
-                foreach (var d in subdirs)
+                // Límites: se muestran como mucho 3000 elementos y se examinan como mucho 50000.
+                const int MaxEntries = 3000, MaxScanned = 50000;
+                int scanned = 0;
+                var subdirs = new List<DirectoryInfo>();
+                foreach (var d in info.EnumerateDirectories())
                 {
+                    if (++scanned > MaxScanned) break;
                     if ((d.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0 || d.Name.StartsWith(".")) continue;
+                    if ((d.Attributes & FileAttributes.ReparsePoint) != 0 && IsSymlink(d.FullName)) continue;
+                    subdirs.Add(d);
+                    if (subdirs.Count >= MaxEntries) break;
+                }
+                subdirs.Sort((a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
+                foreach (var d in subdirs)
                     dirs.Add(new Dictionary<string, object> { { "name", d.Name }, { "path", d.FullName } });
-                }
-                var fs = info.GetFiles();
-                Array.Sort(fs, (a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
-                foreach (var f in fs)
+
+                var mds = new List<FileInfo>();
+                foreach (var f in info.EnumerateFiles())
                 {
-                    if ((f.Attributes & FileAttributes.Hidden) != 0 || !IsMarkdown(f.FullName) || f.Extension.ToLowerInvariant() == ".txt") continue;
-                    files.Add(new Dictionary<string, object> { { "name", f.Name }, { "path", f.FullName } });
+                    if (++scanned > MaxScanned) break;
+                    if ((f.Attributes & FileAttributes.Hidden) != 0 || !IsMarkdown(f.Name) ||
+                        string.Equals(f.Extension, ".txt", StringComparison.OrdinalIgnoreCase)) continue;
+                    mds.Add(f);
+                    if (mds.Count >= MaxEntries) break;
                 }
+                mds.Sort((a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
+                foreach (var f in mds)
+                    files.Add(new Dictionary<string, object> { { "name", f.Name }, { "path", f.FullName } });
             }
             catch (Exception e) { data["error"] = e.Message; }
             data["path"] = path;
             data["dirs"] = dirs;
             data["files"] = files;
-            web.CoreWebView2.PostWebMessageAsJson(json.Serialize(data));
+            return data;
         }
 
         static string Str(Dictionary<string, object> d, string k)
@@ -341,32 +516,45 @@ namespace MdLector
         void LoadIntoTab(Tab tab, string path, bool keepScroll, string hash, bool activate)
         {
             string text;
-            try { text = ReadText(path); }
-            catch (IOException) { if (keepScroll) { dirty.Add(tab.Id); reloadTimer.Start(); } return; }
+            try { text = ReadText(path); tab.Retries = 0; }
+            catch (IOException)
+            {
+                // Bloqueado mientras otro programa lo guarda: unos pocos reintentos y se deja.
+                if (keepScroll && ++tab.Retries <= 8) { dirty.Add(tab.Id); reloadTimer.Start(); }
+                return;
+            }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "No se pudo leer el archivo:\n" + ex.Message, "Lector MD",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // Recargas automáticas: en silencio. Aperturas: avisar.
+                if (!keepScroll)
+                    MessageBox.Show(this, "No se pudo leer el archivo:\n" + ex.Message, "Lector MD",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             var c = web.CoreWebView2;
+            string dir = Path.GetDirectoryName(path);
+            // URL virtual de la pestaña = ruta desde la raíz de la unidad (o recurso compartido), para que
+            // funcionen rutas relativas como ../img.png. Solo se sirven imágenes (OnImageRequested).
+            string root = Path.GetPathRoot(path);
+            tab.Root = root;
             if (!SamePath(tab.Path, path))
             {
-                try { c.ClearVirtualHostNameToFolderMapping(tab.Host); } catch { }
-                c.SetVirtualHostNameToFolderMapping(tab.Host, Path.GetDirectoryName(path),
-                    CoreWebView2HostResourceAccessKind.Allow);
                 tab.Path = path;
                 Watch(tab);
             }
+            var segs = new List<string>();
+            foreach (string s in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
+                segs.Add(Uri.EscapeDataString(s));
+            string baseUrl = "https://" + tab.Host + "/" + string.Join("/", segs.ToArray()) + (segs.Count > 0 ? "/" : "");
 
             var data = new Dictionary<string, object>();
             data["type"] = "doc";
             data["tab"] = tab.Id;
-            data["host"] = tab.Host;
+            data["base"] = baseUrl;
             data["name"] = Path.GetFileName(path);
             data["path"] = path;
-            data["dir"] = Path.GetDirectoryName(path);
+            data["dir"] = dir;
             data["text"] = text;
             data["keepScroll"] = keepScroll;
             data["canBack"] = tab.History.Count > 0;
@@ -380,7 +568,6 @@ namespace MdLector
             tabs.Remove(tab.Id);
             dirty.Remove(tab.Id);
             if (tab.Watcher != null) { tab.Watcher.EnableRaisingEvents = false; tab.Watcher.Dispose(); }
-            try { web.CoreWebView2.ClearVirtualHostNameToFolderMapping(tab.Host); } catch { }
             if (active == tab) active = null;
         }
 
@@ -389,14 +576,19 @@ namespace MdLector
             return a != null && b != null && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         }
 
+        const long MaxFileBytes = 8L * 1024 * 1024;
+
         static string ReadText(string path)
         {
             byte[] bytes;
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (var ms = new MemoryStream())
             {
-                fs.CopyTo(ms);
-                bytes = ms.ToArray();
+                if (fs.Length > MaxFileBytes)
+                    throw new InvalidDataException("El archivo supera 8 MB; no parece un documento Markdown.");
+                bytes = new byte[fs.Length];
+                int read = 0, n;
+                while (read < bytes.Length && (n = fs.Read(bytes, read, bytes.Length - read)) > 0) read += n;
+                if (read < bytes.Length) Array.Resize(ref bytes, read);
             }
             if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
             if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
@@ -430,17 +622,91 @@ namespace MdLector
             Uri uri;
             if (!Uri.TryCreate(href, UriKind.Absolute, out uri)) return;
 
-            if (tab != null && tab.Path != null && uri.Host.Equals(tab.Host, StringComparison.OrdinalIgnoreCase))
+            if (tab != null && tab.Root != null && uri.Host.Equals(tab.Host, StringComparison.OrdinalIgnoreCase))
             {
-                string rel = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/')).Replace('/', '\\');
-                string local = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(tab.Path), rel));
+                string local = ResolveInRoot(tab.Root, uri.AbsolutePath);
+                if (local == null) return;
                 string hash = uri.Fragment.Length > 1 ? Uri.UnescapeDataString(uri.Fragment.Substring(1)) : null;
                 if (IsMarkdown(local)) { OpenPath(local, newTab ? null : tab, hash); return; }
-                if (File.Exists(local) || Directory.Exists(local)) ShellOpen(local);
+                if (Directory.Exists(local)) { Explorer("\"" + local + "\""); return; }
+                if (!File.Exists(local)) return;
+                // Un enlace nunca ejecuta nada: solo se abren tipos inofensivos; el resto se muestra en el Explorador.
+                if (SafeToOpen(local)) ShellOpen(local); else Explorer("/select,\"" + local + "\"");
                 return;
             }
-            if (uri.Scheme == "http" || uri.Scheme == "https" || uri.Scheme == "mailto")
+            if (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeMailto)
                 ShellOpen(uri.AbsoluteUri);
+        }
+
+        // Convierte la ruta de la URL virtual en ruta local, sin permitir salir de la raíz
+        // (ni saltar a otra unidad o a un recurso de red \\servidor).
+        static string ResolveInRoot(string root, string urlPath)
+        {
+            try
+            {
+                string rel = Uri.UnescapeDataString(urlPath).TrimStart('/').Replace('/', '\\');
+                if (rel.IndexOf(':') >= 0 || rel.StartsWith("\\")) return null;
+                string full = Path.GetFullPath(Path.Combine(root, rel));
+                string prefix = root.TrimEnd('\\') + "\\";
+                if (!(full + "\\").StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+                return HasSymlink(full, prefix) ? null : full;
+            }
+            catch { return null; }
+        }
+
+        // ¿Algún tramo de la ruta (bajo la raíz) es un enlace simbólico? Podría apuntar a \\servidor.
+        // Las uniones (junctions) y los marcadores de OneDrive se permiten: no pueden saltar a la red.
+        const uint ReparseTagSymlink = 0xA000000C;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct WIN32_FIND_DATA
+        {
+            public uint dwFileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+            public uint nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string cAlternateFileName;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr FindFirstFile(string name, out WIN32_FIND_DATA data);
+        [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr h);
+
+        // Se recorre de la raíz hacia la hoja: cada consulta solo atraviesa tramos ya comprobados,
+        // así que la propia comprobación nunca sigue un enlace hacia la red. Ante cualquier error: inseguro.
+        static bool HasSymlink(string full, string rootPrefix)
+        {
+            string cur = rootPrefix.TrimEnd('\\');
+            foreach (string part in full.Substring(rootPrefix.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (part.IndexOfAny(new[] { '*', '?' }) >= 0) return true; // FindFirstFile los trataría como comodines
+                cur += "\\" + part;
+                WIN32_FIND_DATA d;
+                IntPtr h = FindFirstFile(cur, out d);
+                if (h == new IntPtr(-1)) return true;
+                FindClose(h);
+                if ((d.dwFileAttributes & (uint)FileAttributes.ReparsePoint) != 0 && d.dwReserved0 == ReparseTagSymlink)
+                    return true;
+            }
+            return false;
+        }
+
+        static bool IsSymlink(string path)
+        {
+            WIN32_FIND_DATA d;
+            IntPtr h = FindFirstFile(path.TrimEnd('\\'), out d);
+            if (h == new IntPtr(-1)) return true; // ante la duda, no se sigue
+            FindClose(h);
+            return d.dwReserved0 == ReparseTagSymlink;
+        }
+
+        static readonly HashSet<string> SafeExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp" };
+
+        static bool SafeToOpen(string path) { return SafeExtensions.Contains(Path.GetExtension(path) ?? ""); }
+
+        static void Explorer(string args)
+        {
+            try { Process.Start("explorer.exe", args); } catch { }
         }
 
         static void ShellOpen(string target)

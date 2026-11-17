@@ -53,7 +53,7 @@
     document.body.classList.toggle('toc-open', open);
     $('btnToc').setAttribute('aria-pressed', String(open));
     if (remember) store.set('toc', open ? '1' : '0');
-    if (open) syncTree();
+    if (open) { syncTree(); markActive(); }
   }
   const toggleToc = () => setToc(!sideOpen());
   $('btnToc').addEventListener('click', toggleToc);
@@ -258,6 +258,7 @@
   function buildToc(el) {
     headings = el ? [...el.querySelectorAll('h1, h2, h3, h4, h5, h6')] : [];
     tocList.innerHTML = '';
+    activeIdx = -1;
     for (const h of headings) {
       const li = document.createElement('li');
       li.className = 'l' + h.tagName[1];
@@ -273,15 +274,25 @@
     markActive();
   }
 
+  // Título activo del índice: búsqueda binaria (O(log n) lecturas de layout) y como mucho una vez por fotograma.
+  let activeIdx = -1, scrollQueued = false;
   function markActive() {
-    if (!headings.length) return;
-    let idx = 0;
-    for (let i = 0; i < headings.length; i++) {
-      if (headings[i].getBoundingClientRect().top < 100) idx = i; else break;
+    scrollQueued = false;
+    if (!headings.length || pane !== 'index' || !sideOpen()) return;
+    let lo = 0, hi = headings.length - 1, idx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (headings[mid].getBoundingClientRect().top < 100) { idx = mid; lo = mid + 1; } else hi = mid - 1;
     }
-    tocList.querySelectorAll('a').forEach((a, i) => a.classList.toggle('active', i === idx));
+    if (idx === activeIdx) return;
+    const items = tocList.children;
+    if (items[activeIdx]) items[activeIdx].firstChild.classList.remove('active');
+    if (items[idx]) items[idx].firstChild.classList.add('active');
+    activeIdx = idx;
   }
-  addEventListener('scroll', () => requestAnimationFrame(markActive), { passive: true });
+  addEventListener('scroll', () => {
+    if (!scrollQueued) { scrollQueued = true; requestAnimationFrame(markActive); }
+  }, { passive: true });
 
   function scrollToId(id) {
     const t = tabs.get(active);
@@ -372,9 +383,36 @@
   }
 
   /* ---------------- render ---------------- */
+  let highlighter = null;
+  function loadHighlighter() {
+    if (!highlighter) {
+      highlighter = new Promise((resolve) => {
+        const s = document.createElement('script');
+        s.src = 'highlight.min.js';
+        s.onload = resolve;
+        s.onerror = resolve;
+        document.head.appendChild(s);
+      });
+    }
+    return highlighter;
+  }
+
+  // Lista blanca: solo lo que produce Markdown (y el HTML básico habitual en README).
+  const PURIFY = {
+    ALLOWED_TAGS: ['a', 'abbr', 'b', 'blockquote', 'br', 'caption', 'cite', 'code', 'col', 'colgroup', 'dd', 'del',
+      'details', 'dfn', 'div', 'dl', 'dt', 'em', 'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i',
+      'img', 'input', 'ins', 'kbd', 'li', 'mark', 'ol', 'p', 'pre', 'q', 's', 'samp', 'small', 'span', 'strong', 'sub',
+      'summary', 'sup', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul', 'var'],
+    ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'width', 'height', 'align', 'colspan', 'rowspan', 'id', 'name',
+      'class', 'start', 'type', 'checked', 'disabled', 'open', 'lang', 'dir'],
+    ALLOW_DATA_ATTR: false
+  };
+  const PURIFY_FRAGMENT = Object.assign({ RETURN_DOM_FRAGMENT: true }, PURIFY);
+  const allowedRemote = new Set(); // documentos cuyas imágenes externas ha aceptado el usuario (esta sesión)
+
   const ALERTS = { note: 'Nota', tip: 'Consejo', important: 'Importante', warning: 'Advertencia', caution: 'Precaución' };
 
-  function postProcess(el, base, frontMatter) {
+  function postProcess(el, base, frontMatter, docPath) {
     if (frontMatter) {
       const d = document.createElement('details');
       d.className = 'frontmatter';
@@ -400,20 +438,51 @@
       bq.prepend(t);
     });
 
-    // Imágenes relativas → carpeta del documento
-    el.querySelectorAll('img[src]').forEach((img) => {
-      const src = img.getAttribute('src');
-      if (!/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith('//')) {
-        try { img.src = new URL(src, base).href; } catch { /* ruta inválida */ }
-      }
-      img.loading = 'lazy';
+    // Solo casillas de tareas, y de solo lectura.
+    el.querySelectorAll('input').forEach((i) => {
+      if (i.type !== 'checkbox') i.remove(); else i.disabled = true;
     });
 
-    // Resaltado de código + botón copiar
-    el.querySelectorAll('pre > code').forEach((code) => {
-      if (/\blanguage-/.test(code.className)) {
+    // Imágenes: relativas → carpeta del documento. Solo https; nada de rutas con "\" (evita saltos a \\servidor).
+    // Las externas no se cargan hasta que el usuario lo pide (privacidad: avisan al autor de que lo has abierto).
+    const remote = [];
+    el.querySelectorAll('img').forEach((img) => {
+      const src = img.getAttribute('src') || '';
+      let url = null;
+      try { url = new URL(src, base); } catch { /* ruta inválida */ }
+      const local = url && url.protocol === 'https:' && url.hostname.endsWith('.mdlector');
+      const ok = url && ((url.protocol === 'https:' && !/%5c|\\/i.test(url.pathname)) ||
+        (url.protocol === 'data:' && /^data:image\//i.test(url.href)));
+      img.removeAttribute('src');
+      if (!ok) return;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      if (url.protocol === 'https:' && !local && !allowedRemote.has(docPath)) { remote.push([img, url.href]); return; }
+      img.src = url.href;
+    });
+    if (remote.length) {
+      const bar = document.createElement('div');
+      bar.className = 'remote-note';
+      bar.innerHTML = '<span></span><button type="button">Mostrar</button>';
+      bar.firstChild.textContent = remote.length === 1
+        ? 'Hay 1 imagen externa sin cargar (protege tu privacidad).'
+        : 'Hay ' + remote.length + ' imágenes externas sin cargar (protege tu privacidad).';
+      bar.lastChild.addEventListener('click', () => {
+        allowedRemote.add(docPath);
+        remote.forEach(([img, href]) => { img.src = href; });
+        bar.remove();
+      });
+      el.prepend(bar);
+    }
+
+    // Resaltado de código (highlight.js se carga solo si hace falta) + botón copiar
+    const langBlocks = el.querySelectorAll('pre > code[class*="language-"]');
+    if (langBlocks.length) {
+      loadHighlighter().then(() => langBlocks.forEach((code) => {
         try { hljs.highlightElement(code); } catch { /* lenguaje desconocido */ }
-      }
+      }));
+    }
+    el.querySelectorAll('pre > code').forEach((code) => {
       const btn = document.createElement('button');
       btn.className = 'copy';
       btn.type = 'button';
@@ -446,7 +515,7 @@
     if (fm) { frontMatter = fm[1]; text = text.slice(fm[0].length); }
 
     const navigated = t.path && t.path !== msg.path;
-    t.host = msg.host;
+    t.base = msg.base;
     t.name = msg.name;
     t.path = msg.path;
     t.dir = msg.dir;
@@ -454,8 +523,10 @@
     t.tabEl.querySelector('.name').textContent = msg.name;
     t.tabEl.title = msg.path;
 
-    t.el.innerHTML = DOMPurify.sanitize(marked.parse(text), { FORBID_TAGS: ['style', 'form'] });
-    postProcess(t.el, 'https://' + msg.host + '/', frontMatter);
+    // Se sanea y procesa en un fragmento inerte (nada se descarga) y solo después se inserta en la página.
+    const frag = DOMPurify.sanitize(marked.parse(text), PURIFY_FRAGMENT);
+    postProcess(frag, msg.base, frontMatter, msg.path);
+    t.el.replaceChildren(frag);
     if (!msg.keepScroll || navigated) t.scroll = 0;
 
     if (msg.activate || isActive) {
@@ -484,7 +555,7 @@
     const t = tabs.get(active);
     if (!t) return;
     let abs;
-    try { abs = new URL(href, 'https://' + t.host + '/').href; } catch { return; }
+    try { abs = new URL(href, t.base).href; } catch { return; }
     send({ type: 'link', tab: t.id, href: abs, newTab });
   }
   document.addEventListener('click', (e) => onLink(e, e.ctrlKey));
@@ -527,8 +598,9 @@
   addEventListener('drop', () => { dragDepth = 0; document.body.classList.remove('dragging'); });
 
   let toastTimer;
+  const toastEl = $('toast'); // referencia fija: un documento podría traer otro id="toast"
   function toast(text) {
-    const el = $('toast');
+    const el = toastEl;
     el.textContent = text;
     el.classList.add('show');
     clearTimeout(toastTimer);

@@ -6,23 +6,40 @@ $src  = Join-Path $root 'src'
 $deps = Join-Path $root 'deps'
 $out  = Join-Path $root 'out'
 
-# --- dependencias (versiones fijas, se descargan una vez) ---
-$packages = @{
-  'marked'      = 'https://registry.npmjs.org/marked/-/marked-18.2.1.tgz'
-  'dompurify'   = 'https://registry.npmjs.org/dompurify/-/dompurify-3.4.18.tgz'
-  'highlightjs' = 'https://registry.npmjs.org/@highlightjs/cdn-assets/-/cdn-assets-11.11.1.tgz'
-  'webview2'    = 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2903.40/microsoft.web.webview2.1.0.2903.40.nupkg'
-}
-foreach ($p in $packages.GetEnumerator()) {
-  $dir = Join-Path $deps $p.Key
-  if (Test-Path $dir) { continue }
-  New-Item -ItemType Directory -Force $dir | Out-Null
-  $file = Join-Path $deps ($p.Key + '.archive')
-  Write-Host "Descargando $($p.Key)..."
-  Invoke-WebRequest $p.Value -OutFile $file -UseBasicParsing
-  tar -xf $file -C $dir
-  if ($LASTEXITCODE -ne 0) { throw "No se pudo extraer $($p.Key)" }
+# --- dependencias: versión fija + SHA-512 oficial (npm dist.integrity / NuGet packageHash) ---
+$packages = @(
+  @{ Name = 'marked'
+     Url  = 'https://registry.npmjs.org/marked/-/marked-18.2.1.tgz'
+     Hash = 'ii4bxCTCqqwpT86XZWgJNs+ZnAIZksmLGYMViWA7PDIXYIeNo1x6cDdX3JOip9NM/cI6p8z57FxliACboTruMA==' }
+  @{ Name = 'dompurify'
+     Url  = 'https://registry.npmjs.org/dompurify/-/dompurify-3.4.18.tgz'
+     Hash = 'ofe3wI/uNm68HInABYFJYqQxRw1EaKAjNdrFVKqjUY+UZurvNd2L/HuQe097s/4RivWiZyP6tT7aoT8atjfhwg==' }
+  @{ Name = 'highlightjs'
+     Url  = 'https://registry.npmjs.org/@highlightjs/cdn-assets/-/cdn-assets-11.11.1.tgz'
+     Hash = 'VEPdHzwelZ12hEX18BHduqxMZGolcUsrbeokHYxOUIm8X2+M7nx5QPtPeQgRxR9XjhdLv4/7DD5BWOlSrJ3k7Q==' }
+  @{ Name = 'webview2'
+     Url  = 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2903.40/microsoft.web.webview2.1.0.2903.40.nupkg'
+     Hash = 'pDLSrpyma3xyOGXlw3Aowy7XceBdeJbukZzKLVdPCFvyfnn8PrCLylMn6c456ja0TcOOal8IdQCVONDRU2OGkw==' }
+)
+New-Item -ItemType Directory -Force $deps | Out-Null
+foreach ($p in $packages) {
+  $dir = Join-Path $deps $p.Name
+  if (Test-Path (Join-Path $dir '.ok')) { continue }
+  Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  $file = Join-Path $deps ($p.Name + '.download')
+  Write-Host "Descargando $($p.Name)..."
+  Invoke-WebRequest $p.Url -OutFile $file -UseBasicParsing
+  $sha = [Security.Cryptography.SHA512]::Create()
+  $actual = [Convert]::ToBase64String($sha.ComputeHash([IO.File]::ReadAllBytes($file)))
+  if ($actual -ne $p.Hash) { Remove-Item $file; throw "Hash incorrecto en $($p.Name): la descarga no es la esperada." }
+  $tmp = "$dir.tmp"
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  tar -xf $file -C $tmp
+  if ($LASTEXITCODE -ne 0) { throw "No se pudo extraer $($p.Name)" }
   Remove-Item $file
+  New-Item -ItemType File (Join-Path $tmp '.ok') | Out-Null
+  Rename-Item $tmp $dir
 }
 
 # --- salida ---
