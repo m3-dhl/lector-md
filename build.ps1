@@ -55,6 +55,12 @@ Copy-Item "$deps\webview2\lib\net462\Microsoft.Web.WebView2.Core.dll" $out
 Copy-Item "$deps\webview2\lib\net462\Microsoft.Web.WebView2.WinForms.dll" $out
 Copy-Item "$deps\webview2\runtimes\win-x64\native\WebView2Loader.dll" $out
 Copy-Item "$src\app.ico" $out
+New-Item -ItemType Directory -Force "$out\licenses" | Out-Null
+Copy-Item "$root\LICENSE" "$out\licenses\LectorMD.txt"
+Copy-Item "$deps\marked\package\LICENSE" "$out\licenses\marked.txt"
+Copy-Item "$deps\dompurify\package\LICENSE" "$out\licenses\dompurify.txt"
+Copy-Item "$deps\highlightjs\package\LICENSE" "$out\licenses\highlightjs.txt"
+Copy-Item "$deps\webview2\LICENSE.txt" "$out\licenses\webview2.txt"
 
 # --- compilar ---
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'

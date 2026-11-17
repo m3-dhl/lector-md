@@ -11,9 +11,13 @@ Lector de Markdown para Windows: ligero (~1 MB), una ventana con pestañas, índ
 - Seguro ante documentos hostiles: sin scripts (CSP + DOMPurify), los enlaces nunca ejecutan programas, no se sale de la unidad ni salta a `\\servidor`, imágenes externas solo bajo demanda.
 
 ## Qué hacer
+**Instalar:** descarga el `.zip` de [Releases](https://github.com/m3-dhl/lector-md/releases/latest), descomprímelo y ejecuta `Instalar.cmd`.
+
+**Compilar:**
 ```powershell
 .\build.ps1      # descarga dependencias y compila en .\out
 .\install.ps1    # instala para el usuario actual y asocia .md
+.\package.ps1    # opcional: genera el zip de la release en .\dist
 ```
 Se instala sin permisos de administrador en `%LOCALAPPDATA%\Programs\MdLector`. Se desinstala desde *Configuración → Aplicaciones instaladas*.
 

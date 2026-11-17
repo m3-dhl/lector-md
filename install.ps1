@@ -33,6 +33,8 @@ Get-Process MdLector -ErrorAction SilentlyContinue | Stop-Process -Force
 New-Item -ItemType Directory -Force $dest | Out-Null
 Copy-Item "$src\*" $dest -Recurse -Force
 Copy-Item $PSCommandPath (Join-Path $dest 'install.ps1') -Force
+# Quitar la marca de "descargado de Internet" que hereda el zip de la release
+Get-ChildItem $dest -Recurse -File | Unblock-File
 
 # --- tipo de archivo ---
 $cmd = "`"$exe`" `"%1`""
@@ -68,7 +70,7 @@ $s.Save()
 New-Item $uninst -Force | Out-Null
 $size = [int]((Get-ChildItem $dest -Recurse | Measure-Object Length -Sum).Sum / 1KB)
 $props = @{
-  DisplayName = 'Lector MD'; DisplayVersion = '1.3.0'; Publisher = 'Local'; DisplayIcon = "`"$exe`",0"
+  DisplayName = 'Lector MD'; DisplayVersion = '1.3.0'; Publisher = 'Lector MD'; DisplayIcon = "`"$exe`",0"
   InstallLocation = $dest; EstimatedSize = $size; NoModify = 1; NoRepair = 1
   UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$dest\install.ps1`" -Uninstall"
 }
