@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="es" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lector MD</title>
+<link rel="stylesheet" href="hl-light.css" id="hlLight">
+<link rel="stylesheet" href="hl-dark.css" id="hlDark" disabled>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="bar">
+  <div id="tabs" role="tablist"></div>
+  <button id="btnNew" class="icon" title="Abrir archivo (Ctrl+O)">
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+  <div class="tools">
+    <button id="btnBack" class="icon" title="Atrás (Alt+←)" hidden>
+      <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <button id="btnToc" class="icon" title="Panel lateral: índice y archivos (Ctrl+B)">
+      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+    </button>
+    <button id="btnTheme" class="icon" title="Tema">
+      <svg viewBox="0 0 24 24" id="icoTheme"></svg>
+    </button>
+  </div>
+</header>
+
+<nav id="toc" aria-label="Panel lateral">
+  <div class="side-tabs" role="tablist">
+    <button role="tab" data-pane="index" id="sideTabIndex">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg>Índice
+    </button>
+    <button role="tab" data-pane="files" id="sideTabFiles">
+      <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Archivos
+    </button>
+  </div>
+
+  <div class="pane" id="paneIndex" role="tabpanel">
+    <ul id="tocList"></ul>
+    <p class="pane-empty" id="tocEmpty" hidden>Este documento no tiene títulos.</p>
+  </div>
+
+  <div class="pane" id="paneFiles" role="tabpanel" hidden>
+    <div class="tree-head">
+      <button class="icon sm" id="treeUp" title="Subir a la carpeta superior">
+        <svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+      </button>
+      <span class="tree-root" id="treeRoot"></span>
+      <button class="icon sm" id="treeLocate" title="Mostrar el documento abierto">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+      </button>
+      <button class="icon sm" id="treeRefresh" title="Actualizar">
+        <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg>
+      </button>
+      <button class="icon sm" id="treeExplore" title="Abrir en el Explorador de Windows">
+        <svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>
+      </button>
+    </div>
+    <ul id="tree" class="tree" role="tree"></ul>
+    <p class="pane-empty" id="treeMsg" hidden></p>
+  </div>
+</nav>
+
+<main id="view">
+  <section id="empty">
+    <svg viewBox="0 0 48 48" class="empty-ico"><rect x="6" y="10" width="36" height="28" rx="5"/><path d="M13 31V18l5 6 5-6v13M31 18v12m-4-4 4 4 4-4"/></svg>
+    <h1>Abre un documento Markdown</h1>
+    <p>Arrastra un archivo <code>.md</code> a esta ventana o pulsa <kbd>Ctrl</kbd>+<kbd>O</kbd>.</p>
+    <button id="btnOpenBig" class="primary">Abrir archivo…</button>
+  </section>
+</main>
+
+<div id="toast" role="status"></div>
+
+<script src="marked.umd.js"></script>
+<script src="purify.min.js"></script>
+<script src="highlight.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
