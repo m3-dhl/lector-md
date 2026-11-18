@@ -100,6 +100,9 @@ namespace MdLector
         static readonly string DataDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MdLector");
         static readonly string WindowFile = Path.Combine(DataDir, "window.txt");
+        static readonly string RecentFile = Path.Combine(DataDir, "recent.txt");
+        const int MaxRecent = 10;
+        List<string> recent; // documentos abiertos recientemente, el último primero
 
         readonly WebView2 web;
         readonly Task<CoreWebView2Environment> envTask;
@@ -394,6 +397,7 @@ namespace MdLector
             {
                 case "ready":
                     ready = true;
+                    SendRecent();
                     foreach (string p in pending) OpenPath(p, null, null);
                     pending.Clear();
                     break;
@@ -438,6 +442,12 @@ namespace MdLector
                     break;
                 case "save": SaveTab(tab, Str(msg, "text"), Str(msg, "then"), Str(msg, "saveAs") == "True"); break;
                 case "newDoc": NewDoc(); break;
+                case "forgetRecent":
+                    LoadRecent();
+                    recent.RemoveAll(r => SamePath(r, Str(msg, "path")));
+                    SaveRecent();
+                    SendRecent();
+                    break;
                 case "askClose":
                     if (tab == null) break;
                     var answer = MessageBox.Show(this, "¿Guardar los cambios en «" + DisplayName(tab) + "»?",
@@ -550,7 +560,7 @@ namespace MdLector
                     return;
                 }
                 WriteAtomic(path, Encode(tab, text));
-                if (moved) { tab.Path = path; Watch(tab); }
+                if (moved) { tab.Path = path; Watch(tab); AddRecent(path); }
                 SetStamp(tab);
                 unsaved.Remove(tab.Id);
                 res["ok"] = true;
@@ -769,6 +779,7 @@ namespace MdLector
             }
             tab.Enc = enc;
             SetStamp(tab);
+            if (!keepScroll) AddRecent(path);
             var segs = new List<string>();
             foreach (string s in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
                 segs.Add(Uri.EscapeDataString(s));
@@ -787,6 +798,62 @@ namespace MdLector
             data["hash"] = hash ?? "";
             data["activate"] = activate;
             c.PostWebMessageAsJson(json.Serialize(data));
+        }
+
+        // ---------- recientes ----------
+        void LoadRecent()
+        {
+            if (recent != null) return;
+            recent = new List<string>();
+            try
+            {
+                if (!File.Exists(RecentFile)) return;
+                foreach (string l in File.ReadAllLines(RecentFile, Encoding.UTF8))
+                {
+                    string p = l.Trim();
+                    if (p.Length > 0 && Path.IsPathRooted(p) && IsMarkdown(p) && recent.Count < MaxRecent &&
+                        !recent.Exists(r => SamePath(r, p)))
+                        recent.Add(p);
+                }
+            }
+            catch { }
+        }
+
+        void SaveRecent()
+        {
+            try
+            {
+                Directory.CreateDirectory(DataDir);
+                File.WriteAllLines(RecentFile, recent.ToArray(), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        void AddRecent(string path)
+        {
+            LoadRecent();
+            if (recent.Count > 0 && SamePath(recent[0], path)) return;
+            recent.RemoveAll(r => SamePath(r, path));
+            recent.Insert(0, path);
+            if (recent.Count > MaxRecent) recent.RemoveRange(MaxRecent, recent.Count - MaxRecent);
+            SaveRecent();
+            SendRecent();
+        }
+
+        void SendRecent()
+        {
+            if (!ready) return;
+            LoadRecent();
+            var items = new List<object>();
+            foreach (string p in recent)
+            {
+                // Las rutas de red no se comprueban: una unidad desconectada bloquearía la ventana.
+                if (!p.StartsWith(@"\\") && !File.Exists(p)) continue;
+                items.Add(new Dictionary<string, object> {
+                    { "path", p }, { "name", Path.GetFileName(p) },
+                    { "dir", Path.GetFileName(Path.GetDirectoryName(p)) ?? "" } });
+            }
+            Post(new Dictionary<string, object> { { "type", "recent" }, { "items", items } });
         }
 
         void CloseTab(Tab tab)

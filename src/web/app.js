@@ -222,6 +222,7 @@
         row.classList.toggle('current', p === cur);
         row.classList.toggle('open-doc', open.has(p));
       });
+      markRecent();
     }
 
     return {
@@ -230,6 +231,56 @@
       get parent() { return parent; }
     };
   })();
+
+  /* ---------------- recientes (encima del árbol) ---------------- */
+  const recentList = $('recentList');
+  let recentOpen = store.get('recentOpen') !== '0';
+  function setRecentOpen(open) {
+    recentOpen = open;
+    $('recentHead').setAttribute('aria-expanded', String(open));
+    recentList.hidden = !open;
+    store.set('recentOpen', open ? '1' : '0');
+  }
+  $('recentHead').addEventListener('click', () => setRecentOpen(!recentOpen));
+  setRecentOpen(recentOpen);
+
+  function onRecent(m) {
+    const items = Array.isArray(m.items) ? m.items : [];
+    recentList.replaceChildren();
+    for (const it of items) {
+      const li = document.createElement('li');
+      li.className = 'file';
+      li.dataset.path = it.path;
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.title = it.path;
+      row.innerHTML = ICON_FILE + '<span class="label"></span><span class="where"></span>' +
+        '<button type="button" class="icon xs forget" title="Quitar de recientes">' +
+        '<svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg></button>';
+      row.querySelector('.label').textContent = it.name;
+      row.querySelector('.where').textContent = it.dir;
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.forget')) { send({ type: 'forgetRecent', path: it.path }); return; }
+        send({ type: 'openFile', path: it.path });
+      });
+      li.appendChild(row);
+      recentList.appendChild(li);
+    }
+    $('recent').hidden = !items.length;
+    markRecent();
+  }
+
+  function markRecent() {
+    const t = tabs.get(active);
+    const norm = (p) => String(p || '').toLowerCase();
+    const cur = t ? norm(t.path) : '';
+    const open = new Set([...tabs.values()].map((x) => norm(x.path)));
+    recentList.querySelectorAll('li.file').forEach((li) => {
+      const p = norm(li.dataset.path);
+      li.firstElementChild.classList.toggle('current', p === cur);
+      li.firstElementChild.classList.toggle('open-doc', open.has(p));
+    });
+  }
 
   function syncTree() {
     if (pane !== 'files' || !sideOpen()) return;
@@ -918,6 +969,7 @@
       const m = e.data;
       if (m && m.type === 'doc') render(m);
       else if (m && m.type === 'dir') tree.onDir(m);
+      else if (m && m.type === 'recent') onRecent(m);
       else if (m && m.type === 'saved') onSaved(m);
       else if (m && m.type === 'saveTab') save(tabs.get(m.tab), m.then);
       else if (m && m.type === 'saveAll') saveAll();

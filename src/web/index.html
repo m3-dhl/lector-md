@@ -50,6 +50,12 @@
   </div>
 
   <div class="pane" id="paneFiles" role="tabpanel" hidden>
+    <section id="recent" hidden>
+      <button type="button" id="recentHead" class="section-head" aria-expanded="true" aria-controls="recentList">
+        <svg class="chev" viewBox="0 0 12 12"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>Recientes
+      </button>
+      <ul id="recentList" class="tree"></ul>
+    </section>
     <div class="tree-head">
       <button class="icon sm" id="treeUp" title="Subir a la carpeta superior">
         <svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
