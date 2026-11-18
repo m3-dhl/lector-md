@@ -542,7 +542,7 @@
       return;
     }
     // Eco del propio guardado (o el archivo no cambió mientras editas): nada que hacer.
-    if (!navigated && (t.editing || Date.now() - t.savedAt < 3000) && text === t.source && t.el.firstChild) {
+    if (!navigated && t.path === msg.path && (t.editing || Date.now() - t.savedAt < 3000) && text === t.source && t.el.firstChild) {
       if (msg.activate) activate(t.id);
       return;
     }
@@ -552,10 +552,23 @@
     t.path = msg.path;
     t.tabEl.querySelector('.name').textContent = msg.name;
     t.tabEl.title = msg.path;
-    t.eol = /\r\n/.test(raw) ? '\r\n' : '\n';
+    if (msg.untitled) {
+      // Pestaña nueva en blanco: directamente a escribir.
+      t.untitled = true;
+      t.editing = true;
+    } else if (t.untitled) {
+      t.untitled = false;
+      if (!msg.keepScroll) t.editing = false; // se abrió un archivo en ella (no es su primer guardado)
+    }
+    if (raw) t.eol = /\r\n/.test(raw) ? '\r\n' : '\n';
     t.saved = t.source = text;
     t.conflict = null;
-    if (t.ta && t.ta.value !== text) setEditorText(t, text);
+    if (t.editing && !t.ta) createEditor(t);
+    if (t.ta) {
+      t.ta.placeholder = t.untitled ? 'Escribe en Markdown… o abre un archivo existente con Ctrl+O' : '';
+      t.ta.setAttribute('aria-label', 'Texto Markdown de ' + t.name);
+      if (t.ta.value !== text) setEditorText(t, text);
+    }
     paint(t, text);
     if (!msg.keepScroll || navigated) t.scroll = 0;
 
@@ -672,13 +685,15 @@
     updateConflict();
   });
 
-  function save(t, then) {
+  function save(t, then, saveAs) {
     if (!t) return;
     if (t.ta) refreshPreview(t);
-    if (!t.dirty && !then) { toast('Sin cambios que guardar'); return; }
+    if (!t.dirty && !then && !saveAs && !t.untitled) { toast('Sin cambios que guardar'); return; }
     t.pendingSave = t.source;
-    send({ type: 'save', tab: t.id, text: t.eol === '\n' ? t.source : t.source.replace(/\n/g, t.eol), then: then || '' });
+    send({ type: 'save', tab: t.id, text: t.eol === '\n' ? t.source : t.source.replace(/\n/g, t.eol),
+      then: then || '', saveAs: !!saveAs });
   }
+  const newDoc = () => send({ type: 'newDoc' });
 
   function onSaved(m) {
     const t = tabs.get(m.tab);
@@ -825,7 +840,8 @@
     else if (k === 'f5' || (e.ctrlKey && k === 'r')) { e.preventDefault(); if (active !== null) send({ type: 'reload', tab: active }); }
     else if (e.altKey && k === 'arrowleft') { e.preventDefault(); goBack(); }
     else if (e.ctrlKey && !e.shiftKey && k === 'e') { e.preventDefault(); toggleEdit(); }
-    else if (e.ctrlKey && !e.shiftKey && k === 's') { e.preventDefault(); save(tabs.get(active)); }
+    else if (e.ctrlKey && k === 's') { e.preventDefault(); save(tabs.get(active), '', e.shiftKey); }
+    else if (e.ctrlKey && !e.shiftKey && (k === 'n' || k === 't')) { e.preventDefault(); newDoc(); }
     else if (e.ctrlKey && (k === 'w' || k === 'f4')) { e.preventDefault(); if (active !== null) closeTab(active); else send({ type: 'close' }); }
     else if (e.ctrlKey && k === 'tab') { e.preventDefault(); cycle(e.shiftKey ? -1 : 1); }
     else if (e.ctrlKey && k === 'pagedown') { e.preventDefault(); cycle(1); }
@@ -841,12 +857,13 @@
   });
 
   /* ---------------- varios ---------------- */
-  $('btnNew').addEventListener('click', () => send({ type: 'open' }));
+  $('btnNew').addEventListener('click', newDoc);
   $('btnOpenBig').addEventListener('click', () => send({ type: 'open' }));
+  $('btnNewBig').addEventListener('click', newDoc);
   $('btnBack').addEventListener('click', goBack);
   $('btnEdit').addEventListener('click', toggleEdit);
   $('btnSave').addEventListener('click', () => save(tabs.get(active)));
-  $('bar').addEventListener('dblclick', (e) => { if (e.target === $('bar') || e.target === tabsBar) send({ type: 'open' }); });
+  $('bar').addEventListener('dblclick', (e) => { if (e.target === $('bar') || e.target === tabsBar) newDoc(); });
 
   let dragDepth = 0;
   addEventListener('dragenter', () => { dragDepth++; document.body.classList.add('dragging'); });

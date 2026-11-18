@@ -206,6 +206,14 @@ button.primary {
   padding: 8px 18px; border-radius: 8px; border: 0; cursor: pointer;
   background: var(--accent); color: var(--bg);
 }
+.empty-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+button.secondary {
+  font: inherit; font-size: 14.5px; font-weight: 600;
+  padding: 7px 17px; border-radius: 8px; cursor: pointer;
+  background: transparent; color: var(--fg); border: 1px solid var(--line);
+}
+button.secondary:hover { background: var(--soft); }
+#editor textarea::placeholder { color: var(--muted); opacity: .8; }
 kbd {
   font: 12.5px "Cascadia Mono", Consolas, monospace;
   padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;

@@ -12,7 +12,7 @@
 <body>
 <header id="bar">
   <div id="tabs" role="tablist"></div>
-  <button id="btnNew" class="icon" title="Abrir archivo (Ctrl+O)">
+  <button id="btnNew" class="icon" title="Nueva pestaña (Ctrl+N)">
     <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
   </button>
   <div class="tools">
@@ -81,9 +81,12 @@
 <main id="view">
   <section id="empty">
     <svg viewBox="0 0 48 48" class="empty-ico"><rect x="6" y="10" width="36" height="28" rx="5"/><path d="M13 31V18l5 6 5-6v13M31 18v12m-4-4 4 4 4-4"/></svg>
-    <h1>Abre un documento Markdown</h1>
-    <p>Arrastra un archivo <code>.md</code> a esta ventana o pulsa <kbd>Ctrl</kbd>+<kbd>O</kbd>.</p>
-    <button id="btnOpenBig" class="primary">Abrir archivo…</button>
+    <h1>Abre o crea un documento Markdown</h1>
+    <p>Arrastra un archivo <code>.md</code> a esta ventana, pulsa <kbd>Ctrl</kbd>+<kbd>O</kbd> para abrir uno o <kbd>Ctrl</kbd>+<kbd>N</kbd> para escribir uno nuevo.</p>
+    <div class="empty-actions">
+      <button id="btnOpenBig" class="primary">Abrir archivo…</button>
+      <button id="btnNewBig" class="secondary">Nuevo documento</button>
+    </div>
   </section>
 </main>
 

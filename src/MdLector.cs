@@ -17,7 +17,7 @@ using Microsoft.Web.WebView2.WinForms;
 
 [assembly: System.Reflection.AssemblyTitle("Lector MD")]
 [assembly: System.Reflection.AssemblyProduct("Lector MD")]
-[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
 
 namespace MdLector
 {
@@ -88,6 +88,7 @@ namespace MdLector
         public Encoding Enc;          // codificación con la que se leyó (se respeta al guardar)
         public DateTime StampTime;    // estado del archivo en disco la última vez que se leyó o guardó
         public long StampLen;
+        public string Name;           // nombre de una pestaña sin archivo ("Sin título")
         public string Host { get { return "t" + Id + ".mdlector"; } }
     }
 
@@ -111,6 +112,7 @@ namespace MdLector
         int nextId = 1;
         Tab active;
         bool ready, closeConfirmed;
+        string lastDir; // carpeta del último documento abierto (para "Guardar" de uno nuevo)
 
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -434,10 +436,11 @@ namespace MdLector
                     if (Str(msg, "dirty") == "True") unsaved.Add(tab.Id); else unsaved.Remove(tab.Id);
                     if (tab == active) UpdateTitle();
                     break;
-                case "save": SaveTab(tab, Str(msg, "text"), Str(msg, "then")); break;
+                case "save": SaveTab(tab, Str(msg, "text"), Str(msg, "then"), Str(msg, "saveAs") == "True"); break;
+                case "newDoc": NewDoc(); break;
                 case "askClose":
-                    if (tab == null || tab.Path == null) break;
-                    var answer = MessageBox.Show(this, "¿Guardar los cambios en «" + Path.GetFileName(tab.Path) + "»?",
+                    if (tab == null) break;
+                    var answer = MessageBox.Show(this, "¿Guardar los cambios en «" + DisplayName(tab) + "»?",
                         "Lector MD", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
                     if (answer == DialogResult.Yes)
                         Post(new Dictionary<string, object> { { "type", "saveTab" }, { "tab", tab.Id }, { "then", "closeTab" } });
@@ -447,24 +450,97 @@ namespace MdLector
             }
         }
 
+        static string DisplayName(Tab tab)
+        {
+            return tab.Path != null ? Path.GetFileName(tab.Path) : tab.Name;
+        }
+
         void UpdateTitle()
         {
-            Text = active != null && active.Path != null
-                ? (unsaved.Contains(active.Id) ? "● " : "") + Path.GetFileName(active.Path) + " — Lector MD"
+            Text = active != null
+                ? (unsaved.Contains(active.Id) ? "● " : "") + DisplayName(active) + " — Lector MD"
                 : "Lector MD";
         }
 
-        // ---------- edición ----------
-        // Solo se escribe en el archivo de la propia pestaña: la página nunca elige la ruta.
-        void SaveTab(Tab tab, string text, string then)
+        // ---------- documento nuevo ----------
+        int untitledCount;
+
+        void NewDoc()
         {
-            if (tab == null || tab.Path == null) return;
+            var t = new Tab { Id = nextId++ };
+            untitledCount++;
+            t.Name = untitledCount == 1 ? "Sin título" : "Sin título " + untitledCount;
+            tabs[t.Id] = t;
+            var data = new Dictionary<string, object>();
+            data["type"] = "doc";
+            data["tab"] = t.Id;
+            data["base"] = "https://" + t.Host + "/"; // sin carpeta todavía: no se sirve ninguna imagen local
+            data["name"] = t.Name;
+            data["path"] = "";
+            data["dir"] = "";
+            data["text"] = "";
+            data["keepScroll"] = false;
+            data["canBack"] = false;
+            data["hash"] = "";
+            data["activate"] = true;
+            data["untitled"] = true;
+            Post(data);
+        }
+
+        // La ruta la elige la persona en el diálogo de Windows (nunca la página).
+        string AskSavePath(Tab tab, string text)
+        {
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = tab.Path == null ? "Guardar documento" : "Guardar como";
+                dlg.Filter = "Markdown (*.md)|*.md|Todos los archivos (*.*)|*.*";
+                dlg.DefaultExt = "md";
+                dlg.AddExtension = true;
+                dlg.FileName = SuggestName(tab, text);
+                string dir = tab.Path != null ? Path.GetDirectoryName(tab.Path) : lastDir;
+                if (dir != null && Directory.Exists(dir)) dlg.InitialDirectory = dir;
+                return dlg.ShowDialog(this) == DialogResult.OK ? dlg.FileName : null;
+            }
+        }
+
+        // Nombre sugerido: el del archivo, o el primer título "# …" del texto.
+        static string SuggestName(Tab tab, string text)
+        {
+            if (tab.Path != null) return Path.GetFileName(tab.Path);
+            string[] lines = text.Split('\n');
+            for (int i = 0; i < lines.Length && i < 40; i++)
+            {
+                string l = lines[i].Trim();
+                if (!l.StartsWith("# ")) continue;
+                var sb = new StringBuilder();
+                foreach (char ch in l.Substring(2).Trim())
+                    if (Array.IndexOf(Path.GetInvalidFileNameChars(), ch) < 0) sb.Append(ch);
+                string name = sb.ToString().Trim().TrimEnd('.');
+                if (name.Length > 80) name = name.Substring(0, 80).Trim();
+                if (name.Length > 0) return name + ".md";
+            }
+            return "documento.md";
+        }
+
+        // ---------- edición ----------
+        // Solo se escribe en el archivo de la propia pestaña, o en el que se elija en el diálogo de Windows.
+        void SaveTab(Tab tab, string text, string then, bool saveAs)
+        {
+            if (tab == null) return;
             var res = new Dictionary<string, object> { { "type", "saved" }, { "tab", tab.Id }, { "ok", false } };
+            bool moved = false;
             try
             {
                 if (text.Length > MaxFileBytes) throw new IOException("El documento supera 8 MB.");
-                var fi = new FileInfo(tab.Path);
-                if (fi.Exists && (fi.LastWriteTimeUtc != tab.StampTime || fi.Length != tab.StampLen) &&
+                string path = tab.Path;
+                if (path == null || saveAs)
+                {
+                    path = AskSavePath(tab, text);
+                    if (path == null) { res["cancelled"] = true; Post(res); return; }
+                    moved = !SamePath(path, tab.Path);
+                }
+                var fi = new FileInfo(path);
+                if (!moved && fi.Exists && (fi.LastWriteTimeUtc != tab.StampTime || fi.Length != tab.StampLen) &&
                     MessageBox.Show(this, "«" + fi.Name + "» ha cambiado en el disco desde que lo abriste.\n\n" +
                         "¿Sobrescribirlo con tu versión?", "Lector MD", MessageBoxButtons.YesNo,
                         MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
@@ -473,13 +549,16 @@ namespace MdLector
                     Post(res);
                     return;
                 }
-                WriteAtomic(tab.Path, Encode(tab, text));
+                WriteAtomic(path, Encode(tab, text));
+                if (moved) { tab.Path = path; Watch(tab); }
                 SetStamp(tab);
                 unsaved.Remove(tab.Id);
                 res["ok"] = true;
             }
             catch (Exception ex) { res["error"] = ex.Message; }
             Post(res);
+            // Nueva ubicación: la pestaña pasa a ser ese archivo (nombre, carpeta, imágenes relativas).
+            if (moved && (bool)res["ok"]) LoadIntoTab(tab, tab.Path, true, null, tab == active);
             if (tab == active) UpdateTitle();
             if (!(bool)res["ok"]) return;
             if (then == "closeTab") Post(new Dictionary<string, object> { { "type", "closeTabNow" }, { "tab", tab.Id } });
@@ -639,14 +718,19 @@ namespace MdLector
             {
                 foreach (Tab t in tabs.Values)
                     if (SamePath(t.Path, path)) { LoadIntoTab(t, path, true, hash, true); return; }
-                target = new Tab { Id = nextId++ };
-                tabs[target.Id] = target;
+                // Pestaña nueva en blanco y sin escribir: el archivo se abre en ella.
+                if (active != null && active.Path == null && !unsaved.Contains(active.Id)) target = active;
+                else
+                {
+                    target = new Tab { Id = nextId++ };
+                    tabs[target.Id] = target;
+                }
             }
-            else if (target.Path != null && !SamePath(target.Path, path))
+            else if (!SamePath(target.Path, path))
             {
                 // Con cambios sin guardar, el enlace se abre en otra pestaña para no perderlos.
                 if (unsaved.Contains(target.Id)) { OpenPath(path, null, hash); return; }
-                target.History.Add(target.Path);
+                if (target.Path != null) target.History.Add(target.Path);
             }
             LoadIntoTab(target, path, false, hash, true);
         }
@@ -673,6 +757,7 @@ namespace MdLector
 
             var c = web.CoreWebView2;
             string dir = Path.GetDirectoryName(path);
+            lastDir = dir;
             // URL virtual de la pestaña = ruta desde la raíz de la unidad (o recurso compartido), para que
             // funcionen rutas relativas como ../img.png. Solo se sirven imágenes (OnImageRequested).
             string root = Path.GetPathRoot(path);
