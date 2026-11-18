@@ -174,17 +174,18 @@
       for (const seg of segs) {
         cur += '\\' + seg.toLowerCase();
         const li = [...container.children].find((x) => x.classList.contains('dir') && norm(x.dataset.path) === cur);
-        if (!li) break;
+        if (!li) return false; // carpeta oculta o fuera del límite: no se llega bajando
         await toggle(li, true);
         container = li.querySelector(':scope > ul');
       }
+      return true;
     }
 
     function reveal(docPath, docDir, force) {
       busy = busy.then(async () => {
         if (!docDir) return;
         if (force || !root || !inside(docDir, root)) await setRoot(docDir);
-        await expandTo(docDir);
+        if (!(await expandTo(docDir))) { await setRoot(docDir); }
         markOpen();
         const cur = ul.querySelector('.row.current');
         if (cur) cur.scrollIntoView({ block: 'nearest' });
@@ -869,6 +870,38 @@
   addEventListener('dragenter', () => { dragDepth++; document.body.classList.add('dragging'); });
   addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
   addEventListener('drop', () => { dragDepth = 0; document.body.classList.remove('dragging'); });
+
+  /* ---------------- rótulos de los botones ---------------- */
+  // Propios en vez de los nativos (que tardan o no salen): aparecen rápido y siempre igual.
+  const tip = document.createElement('div');
+  tip.id = 'tip';
+  tip.setAttribute('role', 'tooltip');
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  let tipTimer;
+  function hideTip() { clearTimeout(tipTimer); tip.hidden = true; }
+  function showTip(b) {
+    if (!b.isConnected || !b.matches(':hover')) return;
+    tip.textContent = b.dataset.tip;
+    tip.hidden = false;
+    const r = b.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+    const x = Math.max(6, Math.min(innerWidth - w - 6, r.left + r.width / 2 - w / 2));
+    const y = r.bottom + 6 + h > innerHeight - 6 ? r.top - h - 6 : r.bottom + 6;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+  }
+  document.addEventListener('pointerover', (e) => {
+    const b = e.target.closest('button[title], button[data-tip]');
+    if (!b || b.contains(e.relatedTarget)) return;
+    if (b.title) { b.dataset.tip = b.title; b.setAttribute('aria-label', b.title); b.removeAttribute('title'); }
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => showTip(b), 350);
+  });
+  document.addEventListener('pointerout', (e) => {
+    const b = e.target.closest('button[data-tip]');
+    if (b && !b.contains(e.relatedTarget)) hideTip();
+  });
+  ['pointerdown', 'keydown', 'scroll', 'blur'].forEach((ev) => addEventListener(ev, hideTip, true));
 
   let toastTimer;
   const toastEl = $('toast'); // referencia fija: un documento podría traer otro id="toast"

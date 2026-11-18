@@ -298,6 +298,13 @@ kbd {
 .md .alert-note { --a: #2f6fe0; } .md .alert-tip { --a: #1a8a4a; } .md .alert-important { --a: #8250df; }
 .md .alert-warning { --a: #b7791f; } .md .alert-caution { --a: #d1242f; }
 
+/* ---------- rótulos de los botones ---------- */
+#tip {
+  position: fixed; z-index: 50; pointer-events: none; max-width: 260px;
+  padding: 5px 9px; border-radius: 6px; font-size: 12.5px; line-height: 1.35;
+  background: var(--fg); color: var(--bg); box-shadow: var(--shadow);
+}
+
 /* ---------- aviso ---------- */
 #toast {
   position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 20px);

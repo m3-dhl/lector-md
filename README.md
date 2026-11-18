@@ -4,7 +4,7 @@ Lector y editor de Markdown para Windows: ligero (~1 MB), una ventana con pesta�
 
 ## Qué
 - Renderiza GitHub Flavored Markdown: tablas, listas de tareas, avisos `> [!NOTE]`, código resaltado y front matter.
-- Pestañas en una sola ventana y panel lateral (`Ctrl+B`) con **Índice** del documento y **Archivos** para navegar carpetas.
+- Pestañas en una sola ventana y panel lateral (`Ctrl+B`) con **Índice** del documento y **Árbol** para navegar carpetas.
 - Editor con vista previa en vivo: respeta la codificación y los saltos de línea, guarda sin dejar archivos a medias y nunca pisa cambios hechos desde otro programa.
 - Recarga sola al cambiar el archivo, tema claro/oscuro, `Ctrl+F` buscar, `Ctrl+P` imprimir.
 - C# (.NET Framework 4.8) + WebView2, ya incluidos en Windows 10/11. Arranca en ~0,6 s y usa ~110 MB.
