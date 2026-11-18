@@ -21,8 +21,8 @@ Lector y editor de Markdown para Windows: ligero (~1 MB), una ventana con pesta�
 ```
 Se instala sin permisos de administrador en `%LOCALAPPDATA%\Programs\MdLector`. Se desinstala desde *Configuración → Aplicaciones instaladas*.
 
-Atajos: `Ctrl+E` editar · `Ctrl+S` guardar · `Ctrl+O` abrir · `Ctrl+W` cerrar pestaña · `Ctrl+Tab` cambiar · `Alt+←` atrás · `F5` recargar.
+Atajos: `Ctrl+N` nuevo · `Ctrl+E` editar · `Ctrl+S` guardar (`Ctrl+Mayús+S` como) · `Ctrl+O` abrir · `Ctrl+W` cerrar pestaña · `Ctrl+Tab` cambiar · `Alt+←` atrás · `F5` recargar.
 
-Licencia: [MIT](LICENSE). Úsalo, modifícalo y distribúyelo libremente.
+Licencia: [MIT](LICENSE).
 
 Dependencias (descargadas y verificadas por SHA-512 al compilar): [marked](https://github.com/markedjs/marked), [DOMPurify](https://github.com/cure53/DOMPurify), [highlight.js](https://github.com/highlightjs/highlight.js), [WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2).

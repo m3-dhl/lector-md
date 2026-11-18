@@ -8,10 +8,23 @@ $exts    = '.md', '.markdown', '.mdown', '.mkd', '.mkdn'
 $lnk     = Join-Path ([Environment]::GetFolderPath('Programs')) 'Lector MD.lnk'
 $uninst  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MdLector'
 
+# Cierra las ventanas de Lector MD de este usuario como si se pulsara la X: si hay cambios sin guardar,
+# la app pregunta. Si sigue abierta, se aborta en vez de perder trabajo.
+function Close-Lector {
+  $procs = @(Get-Process MdLector -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $exe })
+  if (-not $procs.Count) { return }
+  foreach ($p in $procs) { [void]$p.CloseMainWindow() }
+  foreach ($p in $procs) {
+    if (-not $p.WaitForExit(30000)) {
+      throw 'Lector MD sigue abierto (¿cambios sin guardar?). Ciérralo y vuelve a ejecutar el instalador.'
+    }
+  }
+}
+
 Add-Type -Namespace Win -Name Shell -MemberDefinition '[DllImport("shell32.dll")] public static extern void SHChangeNotify(int e, int f, System.IntPtr a, System.IntPtr b);'
 
 if ($Uninstall) {
-  Get-Process MdLector -ErrorAction SilentlyContinue | Stop-Process -Force
+  Close-Lector
   foreach ($e in $exts) {
     $k = "$classes\$e"
     if ((Get-ItemProperty $k -ErrorAction SilentlyContinue).'(default)' -eq $progId) { Set-ItemProperty $k '(default)' '' }
@@ -29,7 +42,7 @@ if ($Uninstall) {
 
 # --- copiar archivos ---
 $src = Join-Path $PSScriptRoot 'out'
-Get-Process MdLector -ErrorAction SilentlyContinue | Stop-Process -Force
+Close-Lector
 New-Item -ItemType Directory -Force $dest | Out-Null
 Copy-Item "$src\*" $dest -Recurse -Force
 Copy-Item $PSCommandPath (Join-Path $dest 'install.ps1') -Force
@@ -69,8 +82,9 @@ $s.Save()
 # --- entrada en "Aplicaciones instaladas" ---
 New-Item $uninst -Force | Out-Null
 $size = [int]((Get-ChildItem $dest -Recurse | Measure-Object Length -Sum).Sum / 1KB)
+$version = (Get-Item $exe).VersionInfo.FileVersion -replace '\.0$', ''
 $props = @{
-  DisplayName = 'Lector MD'; DisplayVersion = '1.5.0'; Publisher = 'Lector MD'; DisplayIcon = "`"$exe`",0"
+  DisplayName = 'Lector MD'; DisplayVersion = $version; Publisher = 'Lector MD'; DisplayIcon = "`"$exe`",0"
   InstallLocation = $dest; EstimatedSize = $size; NoModify = 1; NoRepair = 1
   UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$dest\install.ps1`" -Uninstall"
 }

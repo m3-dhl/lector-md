@@ -1,4 +1,4 @@
-# Compila Lector MD en .\out. Solo necesita Windows 10/11 (csc de .NET Framework 4.x y tar vienen de serie).
+﻿# Compila Lector MD en .\out. Solo necesita Windows 10/11 (csc de .NET Framework 4.x y tar vienen de serie).
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $root = $PSScriptRoot

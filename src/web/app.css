@@ -115,6 +115,7 @@ body.toc-open #toc { transform: none; }
 #toc ul { list-style: none; margin: 0; padding: 0; }
 
 /* recientes */
+#toc .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 #recent { margin-bottom: 8px; }
 .section-head {
   display: flex; align-items: center; gap: 6px; width: 100%;
@@ -126,10 +127,9 @@ body.toc-open #toc { transform: none; }
 .section-head[aria-expanded="true"] .chev { transform: rotate(90deg); }
 #recentList .file > .row { padding-left: 6px; }
 #recentList .where { color: var(--muted); font-size: 12px; margin-left: auto; padding-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; max-width: 45%; }
-#recentList .forget { display: none; flex: none; width: 20px; height: 20px; border-radius: 4px; margin-left: 2px; }
+#recentList .forget { display: inline-flex; opacity: 0; flex: none; width: 20px; height: 20px; border-radius: 4px; margin-left: 2px; }
 #recentList .forget svg { width: 12px; height: 12px; }
-#recentList .row:hover .forget, #recentList .forget:focus-visible { display: inline-flex; }
-#recentList .row:hover .where { display: none; }
+#recentList .row:hover .forget, #recentList .row:focus-within .forget { opacity: 1; }
 
 /* árbol de archivos */
 .tree-head {
@@ -205,7 +205,7 @@ body.editing #view { padding-left: calc(var(--side, 0px) + (100vw - var(--side, 
 }
 
 /* ---------- vista ---------- */
-#view { min-height: 100%; padding: calc(var(--bar-h) + 40px) 28px 96px; transition: padding .18s ease; }
+#view { min-height: 100%; padding: calc(var(--bar-h) + 40px) 28px 96px; }
 .md { scroll-margin-top: var(--bar-h); }
 .md { max-width: 76ch; margin: 0 auto; overflow-wrap: break-word; }
 

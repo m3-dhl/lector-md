@@ -3,6 +3,11 @@
   const host = window.chrome && window.chrome.webview;
   const send = (m) => { if (host) host.postMessage(JSON.stringify(m)); };
   const $ = (id) => document.getElementById(id);
+  // Rótulo de un botón (tooltip propio + lector de pantalla), también después del primer paso del ratón.
+  function setLabel(b, text) {
+    if (b.dataset.tip !== undefined) { b.dataset.tip = text; b.setAttribute('aria-label', text); }
+    else b.title = text;
+  }
   const root = document.documentElement;
   const view = $('view'), empty = $('empty'), tocList = $('tocList'), tabsBar = $('tabs');
 
@@ -35,7 +40,7 @@
     $('hlLight').disabled = dark;
     $('hlDark').disabled = !dark;
     $('icoTheme').innerHTML = THEME_ICON[theme];
-    $('btnTheme').title = 'Tema: ' + THEME_NAME[theme];
+    setLabel($('btnTheme'), 'Tema: ' + THEME_NAME[theme]);
     send({ type: 'theme', dark });
   }
   mq.addEventListener('change', applyTheme);
@@ -91,6 +96,9 @@
         const req = String(++reqN);
         waiting.set(req, resolve);
         send({ type: 'listDir', path, req });
+        setTimeout(() => {
+          if (waiting.delete(req)) resolve({ path, name: path, error: true, dirs: [], files: [] });
+        }, 20000);
       });
     }
     function onDir(m) {
@@ -114,8 +122,10 @@
         li.className = 'dir';
         li.dataset.path = dir.path;
         li.setAttribute('role', 'treeitem');
+        li.setAttribute('aria-expanded', 'false');
         const row = document.createElement('div');
         row.className = 'row';
+        row.tabIndex = 0;
         row.title = dir.path;
         row.innerHTML = ICON_DIR + '<span class="label"></span>';
         row.querySelector('.label').textContent = dir.name;
@@ -133,6 +143,7 @@
         li.setAttribute('role', 'treeitem');
         const row = document.createElement('div');
         row.className = 'row';
+        row.tabIndex = 0;
         row.title = f.path;
         row.innerHTML = ICON_FILE + '<span class="label"></span>';
         row.querySelector('.label').textContent = f.name;
@@ -150,6 +161,7 @@
         li.dataset.loaded = '1';
       }
       li.classList.toggle('expanded', want);
+      li.setAttribute('aria-expanded', String(want));
       sub.hidden = !want;
       if (want) markOpen();
     }
@@ -253,6 +265,7 @@
       li.dataset.path = it.path;
       const row = document.createElement('div');
       row.className = 'row';
+      row.tabIndex = 0;
       row.title = it.path;
       row.innerHTML = ICON_FILE + '<span class="label"></span><span class="where"></span>' +
         '<button type="button" class="icon xs forget" title="Quitar de recientes">' +
@@ -281,6 +294,18 @@
       li.firstElementChild.classList.toggle('open-doc', open.has(p));
     });
   }
+
+  // Enter o espacio sobre una fila enfocada = clic; flechas para moverse entre filas.
+  $('paneFiles').addEventListener('keydown', (e) => {
+    const row = e.target.closest('.row');
+    if (!row || e.target !== row) return;
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); row.click(); }
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const rows = [...$('paneFiles').querySelectorAll('.row')].filter((r) => r.offsetParent);
+      const i = rows.indexOf(row) + (e.key === 'ArrowDown' ? 1 : -1);
+      if (rows[i]) { e.preventDefault(); rows[i].focus(); }
+    }
+  });
 
   function syncTree() {
     if (pane !== 'files' || !sideOpen()) return;
@@ -315,7 +340,7 @@
       const li = document.createElement('li');
       li.className = 'l' + h.tagName[1];
       const a = document.createElement('a');
-      a.href = '#' + encodeURIComponent(h.id);
+      a.href = '#' + encodeURIComponent(h.id.slice(ID_PREFIX.length));
       a.textContent = h.textContent;
       a.title = h.textContent;
       li.appendChild(a);
@@ -346,10 +371,12 @@
     if (!scrollQueued) { scrollQueued = true; requestAnimationFrame(markActive); }
   }, { passive: true });
 
+  const ID_PREFIX = 'u-';
   function scrollToId(id) {
     const t = tabs.get(active);
-    if (!t) return;
-    const el = t.el.querySelector('#' + CSS.escape(id)) || t.el.querySelector('[name="' + CSS.escape(id) + '"]');
+    if (!t || !id) return;
+    if (id.startsWith(ID_PREFIX) && !t.el.querySelector('#' + CSS.escape(ID_PREFIX + id))) id = id.slice(ID_PREFIX.length);
+    const el = t.el.querySelector('#' + CSS.escape(ID_PREFIX + id)) || t.el.querySelector('[name="' + CSS.escape(id) + '"]');
     if (el) el.scrollIntoView({ block: 'start' });
   }
 
@@ -559,9 +586,11 @@
     });
 
     // Ids de títulos (para índice y enlaces #ancla)
+    // Todos llevan el prefijo "u-": un id del documento nunca coincide con uno de la app (#editor, #toc, #bar…).
+    el.querySelectorAll('[id]').forEach((x) => { x.id = ID_PREFIX + x.id; });
     const used = new Set();
     el.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((h) => {
-      if (!h.id) h.id = slugify(h.textContent, used); else used.add(h.id);
+      if (!h.id) h.id = ID_PREFIX + slugify(h.textContent, used); else used.add(h.id.slice(ID_PREFIX.length));
     });
   }
 
@@ -589,7 +618,8 @@
 
     if (!navigated && t.dirty) {
       // Lo que estás escribiendo nunca se pisa: si el disco trae otra cosa, se avisa.
-      if (text !== t.saved) t.conflict = text;
+      t.conflict = text !== t.saved ? text : null;
+      if (t.conflict === null) send({ type: 'acceptDisk', tab: t.id }); // el disco coincide con tu base
       if (msg.activate) activate(t.id); else if (isActive) updateConflict();
       return;
     }
@@ -666,7 +696,8 @@
       setDirty(t, true);
       // La vista previa se rehace tras una pausa (más larga cuanto mayor el documento).
       clearTimeout(t.timer);
-      t.timer = setTimeout(() => refreshPreview(t), Math.min(800, 120 + ta.value.length / 4000));
+      t.timer = setTimeout(() => refreshPreview(t),
+        Math.max(Math.min(800, 120 + t.source.length / 4000), 2 * (t.paintMs || 0)));
     });
     ta.addEventListener('keydown', (e) => onEditorKey(e, ta));
     ta.addEventListener('scroll', () => syncScroll(t), { passive: true });
@@ -680,8 +711,10 @@
     t.source = t.ta.value;
     setDirty(t, t.source !== t.saved); // deshacer hasta lo guardado quita la marca
     const y = scrollY;
+    const t0 = performance.now();
     paint(t, t.source);
     if (t.id === active) { buildToc(t.el); scrollTo(0, y); }
+    t.paintMs = Math.min(5000, performance.now() - t0);
   }
 
   function syncScroll(t) {
@@ -697,7 +730,7 @@
     const b = $('btnEdit');
     b.hidden = !t;
     b.setAttribute('aria-pressed', String(on));
-    b.title = on ? 'Terminar de editar (Ctrl+E)' : 'Editar (Ctrl+E)';
+    setLabel(b, on ? 'Terminar de editar (Ctrl+E)' : 'Editar (Ctrl+E)');
     $('btnSave').hidden = !(t && t.dirty);
     updateConflict();
     if (on) t.ta.focus({ preventScroll: true });
@@ -722,6 +755,7 @@
     if (!t || t.conflict === null) return;
     t.saved = t.source = t.conflict;
     t.conflict = null;
+    send({ type: 'acceptDisk', tab: t.id });
     if (t.ta) setEditorText(t, t.source);
     setDirty(t, false);
     paint(t, t.source);
@@ -733,6 +767,7 @@
     if (!t || t.conflict === null) return;
     t.saved = t.conflict; // lo del disco pasa a ser la referencia; al guardar, se sobrescribe con lo tuyo
     t.conflict = null;
+    send({ type: 'acceptDisk', tab: t.id });
     setDirty(t, t.source !== t.saved);
     updateConflict();
   });
@@ -867,7 +902,9 @@
     const href = a.getAttribute('href');
     if (href.startsWith('#')) {
       if (newTab) return;
-      scrollToId(decodeURIComponent(href.slice(1)));
+      let id = href.slice(1);
+      try { id = decodeURIComponent(id); } catch { /* ancla mal codificada: tal cual */ }
+      scrollToId(id);
       if (a.closest('#toc') && narrow()) setToc(false);
       return;
     }

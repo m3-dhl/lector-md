@@ -86,8 +86,10 @@ namespace MdLector
         public readonly List<string> History = new List<string>();
         public FileSystemWatcher Watcher;
         public Encoding Enc;          // codificación con la que se leyó (se respeta al guardar)
-        public DateTime StampTime;    // estado del archivo en disco la última vez que se leyó o guardó
+        public DateTime StampTime;    // versión del disco en la que se basa lo que ve el usuario (aviso al sobrescribir)
         public long StampLen;
+        public DateTime DiskTime;     // último estado del disco leído o escrito (evita recargas inútiles)
+        public long DiskLen;
         public string Name;           // nombre de una pestaña sin archivo ("Sin título")
         public string Host { get { return "t" + Id + ".mdlector"; } }
     }
@@ -146,7 +148,15 @@ namespace MdLector
                 foreach (int id in ids)
                 {
                     Tab t;
-                    if (tabs.TryGetValue(id, out t) && t.Path != null) LoadIntoTab(t, t.Path, true, null, false);
+                    if (!tabs.TryGetValue(id, out t) || t.Path == null) continue;
+                    // El aviso del propio guardado (o un cambio solo de atributos) no se vuelve a leer.
+                    try
+                    {
+                        var fi = new FileInfo(t.Path);
+                        if (fi.Exists && t.Retries == 0 && fi.LastWriteTimeUtc == t.DiskTime && fi.Length == t.DiskLen) continue;
+                    }
+                    catch { }
+                    LoadIntoTab(t, t.Path, true, null, false);
                 }
             };
             HandleCreated += delegate
@@ -298,12 +308,39 @@ namespace MdLector
                 HandleLink(active, e.Uri, true);
             };
             c.WebMessageReceived += OnMessage;
+            c.ProcessFailed += OnProcessFailed;
             // Imágenes de los documentos: las sirve la app (no hay carpeta mapeada al motor web).
             // Filtro "All": cualquier petición a *.mdlector se responde aquí (sin tocar la red ni el DNS);
             // solo las imágenes reciben contenido, el resto 404.
             c.AddWebResourceRequestedFilter("https://*.mdlector/*", CoreWebView2WebResourceContext.All);
             c.WebResourceRequested += OnImageRequested;
             c.Navigate(AppPage);
+        }
+
+        // Si el proceso que dibuja la página se cae, se recarga la interfaz y se reabren los documentos.
+        void OnProcessFailed(object sender, CoreWebView2ProcessFailedEventArgs e)
+        {
+            if (e.ProcessFailedKind != CoreWebView2ProcessFailedKind.RenderProcessExited) return;
+            bool lost = unsaved.Count > 0;
+            var ids = new List<int>(tabs.Keys);
+            ids.Sort();
+            foreach (int id in ids)
+            {
+                Tab t = tabs[id];
+                if (t.Path != null) pending.Add(t.Path);
+                if (t.Watcher != null) { t.Watcher.EnableRaisingEvents = false; t.Watcher.Dispose(); }
+            }
+            tabs.Clear();
+            dirty.Clear();
+            unsaved.Clear();
+            active = null;
+            ready = false;
+            pageLoaded = false;
+            UpdateTitle();
+            try { web.CoreWebView2.Navigate(AppPage); } catch { }
+            if (lost)
+                MessageBox.Show(this, "La vista se cerró por un error y se ha recargado.\nLos cambios que no estaban guardados se han perdido.",
+                    "Lector MD", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         const string AppPage = "https://" + AppHost + "/index.html";
@@ -341,10 +378,17 @@ namespace MdLector
                 if (local == null || !ImageTypes.TryGetValue(Path.GetExtension(local) ?? "", out type)) return null;
                 try
                 {
-                    var fs = new FileStream(local, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
-                        64 * 1024, FileOptions.SequentialScan);
-                    if (fs.Length <= MaxImageBytes) return Tuple.Create((Stream)fs, type);
-                    fs.Dispose();
+                    // Se copia a memoria y se cierra el archivo: el motor no libera el flujo y el archivo
+                    // quedaría en uso (no se podría mover ni expulsar la unidad).
+                    using (var fs = new FileStream(local, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                        64 * 1024, FileOptions.SequentialScan))
+                    {
+                        if (fs.Length > MaxImageBytes) return null;
+                        var ms = new MemoryStream((int)fs.Length);
+                        fs.CopyTo(ms);
+                        ms.Position = 0;
+                        return Tuple.Create((Stream)ms, type);
+                    }
                 }
                 catch { }
                 return null;
@@ -376,7 +420,7 @@ namespace MdLector
             if (e.Uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
             {
                 string local = new Uri(e.Uri).LocalPath;
-                if (IsMarkdown(local)) OpenPath(local, null, null);
+                if (!local.StartsWith(@"\\") && IsMarkdown(local)) OpenPath(local, null, null);
                 return;
             }
             HandleLink(active, e.Uri, false);
@@ -442,6 +486,9 @@ namespace MdLector
                     break;
                 case "save": SaveTab(tab, Str(msg, "text"), Str(msg, "then"), Str(msg, "saveAs") == "True"); break;
                 case "newDoc": NewDoc(); break;
+                case "acceptDisk":
+                    if (tab != null) { tab.StampTime = tab.DiskTime; tab.StampLen = tab.DiskLen; }
+                    break;
                 case "forgetRecent":
                     LoadRecent();
                     recent.RemoveAll(r => SamePath(r, Str(msg, "path")));
@@ -605,26 +652,48 @@ namespace MdLector
         {
             string tmp = Path.Combine(Path.GetDirectoryName(path),
                 "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
+            FileStream fs;
+            try { fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024); }
+            catch (UnauthorizedAccessException)
+            {
+                // Carpeta sin permiso para crear archivos nuevos: escritura directa sobre el original.
+                File.WriteAllBytes(path, bytes);
+                return;
+            }
             try
             {
-                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024))
+                // Si falla al escribir (disco lleno, red caída), el original queda intacto y el error sube.
+                using (fs)
                 {
                     fs.Write(bytes, 0, bytes.Length);
                     fs.Flush(true);
                 }
+            }
+            catch { try { File.Delete(tmp); } catch { } throw; }
+            try
+            {
                 if (File.Exists(path)) File.Replace(tmp, path, null, true); else File.Move(tmp, path);
             }
-            catch
+            catch (Exception ex)
             {
-                try { File.Delete(tmp); } catch { }
-                // Algunas unidades (red, FAT, carpetas sin permiso de creación) no lo admiten: escritura directa.
-                File.WriteAllBytes(path, bytes);
+                // Unidades que no admiten la sustitución (algunas de red o FAT): el temporal ya está completo,
+                // así que se copia encima. Si eso también falla, el error sube.
+                if (!(ex is IOException || ex is NotSupportedException || ex is PlatformNotSupportedException))
+                { try { File.Delete(tmp); } catch { } throw; }
+                try { File.Copy(tmp, path, true); }
+                finally { try { File.Delete(tmp); } catch { } }
             }
         }
 
-        static void SetStamp(Tab tab)
+        static void SetStamp(Tab tab, bool baseToo = true)
         {
-            try { var fi = new FileInfo(tab.Path); tab.StampTime = fi.LastWriteTimeUtc; tab.StampLen = fi.Length; }
+            try
+            {
+                var fi = new FileInfo(tab.Path);
+                tab.DiskTime = fi.LastWriteTimeUtc;
+                tab.DiskLen = fi.Length;
+                if (baseToo) { tab.StampTime = tab.DiskTime; tab.StampLen = tab.DiskLen; }
+            }
             catch { }
         }
 
@@ -635,8 +704,12 @@ namespace MdLector
             Task.Run(() => new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(BuildDir(path, req)))
                 .ContinueWith(t =>
                 {
-                    if (t.Status != TaskStatus.RanToCompletion || IsDisposed) return;
-                    try { BeginInvoke((Action)(() => { if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(t.Result); })); }
+                    if (IsDisposed) return;
+                    // Siempre hay respuesta: si no, el árbol de la página se quedaría esperando.
+                    string result = t.Status == TaskStatus.RanToCompletion ? t.Result : new JavaScriptSerializer().Serialize(
+                        new Dictionary<string, object> { { "type", "dir" }, { "req", req }, { "path", path ?? "" },
+                            { "name", path ?? "" }, { "error", true }, { "dirs", new object[0] }, { "files", new object[0] } });
+                    try { BeginInvoke((Action)(() => { if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(result); })); }
                     catch (InvalidOperationException) { }
                 });
         }
@@ -745,23 +818,30 @@ namespace MdLector
             LoadIntoTab(target, path, false, hash, true);
         }
 
+        void ReadFailed(Tab tab, Exception ex)
+        {
+            // Pestaña creada para este archivo y aún vacía: se descarta.
+            if (tab.Path == null && tab.Name == null) tabs.Remove(tab.Id);
+            MessageBox.Show(this, "No se pudo leer el archivo:\n" + ex.Message, "Lector MD",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
         void LoadIntoTab(Tab tab, string path, bool keepScroll, string hash, bool activate)
         {
             string text;
             Encoding enc;
             try { text = ReadText(path, out enc); tab.Retries = 0; }
-            catch (IOException)
+            catch (IOException ex)
             {
                 // Bloqueado mientras otro programa lo guarda: unos pocos reintentos y se deja.
-                if (keepScroll && ++tab.Retries <= 8) { dirty.Add(tab.Id); reloadTimer.Start(); }
+                if (keepScroll) { if (++tab.Retries <= 8) { dirty.Add(tab.Id); reloadTimer.Start(); } }
+                else ReadFailed(tab, ex);
                 return;
             }
             catch (Exception ex)
             {
                 // Recargas automáticas: en silencio. Aperturas: avisar.
-                if (!keepScroll)
-                    MessageBox.Show(this, "No se pudo leer el archivo:\n" + ex.Message, "Lector MD",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (!keepScroll) ReadFailed(tab, ex);
                 return;
             }
 
@@ -777,8 +857,11 @@ namespace MdLector
                 tab.Path = path;
                 Watch(tab);
             }
-            tab.Enc = enc;
-            SetStamp(tab);
+            // Con cambios sin guardar la página conserva los del usuario: la base del aviso de sobrescritura
+            // no se mueve hasta que el usuario resuelve el conflicto (mensaje "acceptDisk").
+            bool keepBase = keepScroll && unsaved.Contains(tab.Id);
+            if (!keepBase) tab.Enc = enc;
+            SetStamp(tab, !keepBase);
             if (!keepScroll) AddRecent(path);
             var segs = new List<string>();
             foreach (string s in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
@@ -840,20 +923,32 @@ namespace MdLector
             SendRecent();
         }
 
+        int recentReq;
         void SendRecent()
         {
             if (!ready) return;
             LoadRecent();
-            var items = new List<object>();
-            foreach (string p in recent)
+            var list = recent.ToArray();
+            int req = ++recentReq;
+            // Comprobar si existen toca el disco (o una unidad de red desconectada): fuera del hilo de la ventana.
+            Task.Run(() =>
             {
-                // Las rutas de red no se comprueban: una unidad desconectada bloquearía la ventana.
-                if (!p.StartsWith(@"\\") && !File.Exists(p)) continue;
-                items.Add(new Dictionary<string, object> {
-                    { "path", p }, { "name", Path.GetFileName(p) },
-                    { "dir", Path.GetFileName(Path.GetDirectoryName(p)) ?? "" } });
-            }
-            Post(new Dictionary<string, object> { { "type", "recent" }, { "items", items } });
+                var items = new List<object>();
+                foreach (string p in list)
+                {
+                    bool ok;
+                    try { ok = p.StartsWith(@"\\") || File.Exists(p); } catch { ok = false; }
+                    if (!ok) continue;
+                    items.Add(new Dictionary<string, object> {
+                        { "path", p }, { "name", Path.GetFileName(p) },
+                        { "dir", Path.GetFileName(Path.GetDirectoryName(p)) ?? "" } });
+                }
+                return items;
+            }).ContinueWith(t =>
+            {
+                if (req != recentReq || t.Status != TaskStatus.RanToCompletion || IsDisposed) return;
+                Post(new Dictionary<string, object> { { "type", "recent" }, { "items", t.Result } });
+            }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         void CloseTab(Tab tab)
